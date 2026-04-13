@@ -22,6 +22,7 @@
 #include "spatial_match.h"
 #include "spatial_keyframe.h"
 #include "spatial_context.h"
+#include "bench_utf8.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,6 +130,8 @@ static void make_prefix(const char* src, char* dst, uint32_t max_bytes) {
 /* ── main ── */
 
 int main(int argc, char* argv[]) {
+    utf8_console_init();
+
     if (argc < 2) {
         fprintf(stderr,
             "Usage: %s <text_file> [max_clauses]\n"

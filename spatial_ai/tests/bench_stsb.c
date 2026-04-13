@@ -25,6 +25,7 @@
 #include "spatial_layers.h"
 #include "spatial_morpheme.h"
 #include "spatial_match.h"
+#include "bench_utf8.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +149,8 @@ static double spearman(const double* x, const double* y, int n) {
 /* ── Main ── */
 
 int main(int argc, char* argv[]) {
+    utf8_console_init();
+
     if (argc < 2) {
         fprintf(stderr,
             "Usage: %s <stsb.tsv> [max_pairs]\n"

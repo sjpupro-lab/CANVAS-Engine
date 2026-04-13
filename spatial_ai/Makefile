@@ -77,26 +77,55 @@ $(BUILD_DIR)/bench_stsb: $(TEST_DIR)/bench_stsb.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/bench_perplexity: $(TEST_DIR)/bench_perplexity.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-bench: $(BUILD_DIR)/bench_stsb $(BUILD_DIR)/bench_perplexity
+$(BUILD_DIR)/bench_word_predict: $(TEST_DIR)/bench_word_predict.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/bench_qa: $(TEST_DIR)/bench_qa.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+bench_word: $(BUILD_DIR)/bench_word_predict
+	@echo "Built bench_word_predict. Run with:"
+	@echo "  ./build/bench_word_predict data/sample_ko.txt"
+	@echo "  ./build/bench_word_predict data/sample_en.txt 1000"
+
+bench_qa: $(BUILD_DIR)/bench_qa
+	@echo "Built bench_qa. Run with:"
+	@echo "  ./build/bench_qa data/qa.tsv"
+
+bench: $(BUILD_DIR)/bench_stsb $(BUILD_DIR)/bench_perplexity \
+       $(BUILD_DIR)/bench_word_predict $(BUILD_DIR)/bench_qa
 	@echo "=== Benchmarks built ==="
-	@echo "  ./build/bench_stsb        data/stsb.tsv"
-	@echo "  ./build/bench_perplexity  data/sample_ko.txt"
+	@echo "  ./build/bench_stsb          data/stsb.tsv"
+	@echo "  ./build/bench_perplexity    data/sample_ko.txt"
+	@echo "  ./build/bench_word_predict  data/sample_ko.txt"
+	@echo "  ./build/bench_qa            data/qa.tsv"
 	@echo ""
 	@if [ -f data/stsb.tsv ]; then \
 		echo "=== Running bench_stsb ==="; \
 		./$(BUILD_DIR)/bench_stsb data/stsb.tsv || true; \
 	else \
-		echo "(skip bench_stsb: data/stsb.tsv not found — run data/download_stsb.ps1)"; \
+		echo "(skip bench_stsb: data/stsb.tsv not found)"; \
 	fi
 	@echo ""
 	@if [ -f data/sample_ko.txt ]; then \
 		echo "=== Running bench_perplexity on sample_ko.txt ==="; \
 		./$(BUILD_DIR)/bench_perplexity data/sample_ko.txt 500 || true; \
+		echo "=== Running bench_word_predict on sample_ko.txt ==="; \
+		./$(BUILD_DIR)/bench_word_predict data/sample_ko.txt 500 || true; \
 	elif [ -f data/sample_en.txt ]; then \
 		echo "=== Running bench_perplexity on sample_en.txt ==="; \
 		./$(BUILD_DIR)/bench_perplexity data/sample_en.txt 500 || true; \
+		echo "=== Running bench_word_predict on sample_en.txt ==="; \
+		./$(BUILD_DIR)/bench_word_predict data/sample_en.txt 500 || true; \
 	else \
-		echo "(skip bench_perplexity: no sample_*.txt — run data/download_wiki.ps1)"; \
+		echo "(skip bench_perplexity/word: no sample_*.txt)"; \
+	fi
+	@echo ""
+	@if [ -f data/qa.tsv ]; then \
+		echo "=== Running bench_qa ==="; \
+		./$(BUILD_DIR)/bench_qa data/qa.tsv || true; \
+	else \
+		echo "(skip bench_qa: data/qa.tsv not found — run data/make_qa.ps1)"; \
 	fi
 
 clean:
