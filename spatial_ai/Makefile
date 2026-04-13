@@ -60,5 +60,15 @@ $(BUILD_DIR)/test_context: $(TEST_DIR)/test_context.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+# Wikipedia stress test (not in default `make test` — run manually)
+$(BUILD_DIR)/test_wiki: $(TEST_DIR)/test_wiki.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+wiki: $(BUILD_DIR)/test_wiki
+	@echo "Built test_wiki. Run with:"
+	@echo "  ./build/test_wiki data/sample_ko.txt"
+	@echo "  ./build/test_wiki data/sample_en.txt"
+	@echo "  ./build/test_wiki data/sample_en.txt 500"
+
 clean:
 	rm -rf $(BUILD_DIR)
