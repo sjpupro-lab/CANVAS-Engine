@@ -45,6 +45,24 @@
 #define CV_HEIGHT     (CV_TILE * CV_ROWS)       /* 1024 */
 #define CV_TOTAL      (CV_WIDTH * CV_HEIGHT)    /* 2,097,152 cells */
 
+/* Canvas-level block summary (for H.264-style scene change detection):
+ *   16×16 pixels per block → 128 × 64 = 8192 blocks per canvas. */
+#define CV_BLOCK        16
+#define CV_BLOCKS_X     (CV_WIDTH  / CV_BLOCK)  /* 128 */
+#define CV_BLOCKS_Y     (CV_HEIGHT / CV_BLOCK)  /*  64 */
+#define CV_BLOCKS_TOTAL (CV_BLOCKS_X * CV_BLOCKS_Y)  /* 8192 */
+
+typedef struct {
+    uint32_t sums[CV_BLOCKS_TOTAL];
+} CanvasBlockSummary;
+
+/* I-frame / P-frame classification for a full canvas, decided by
+ * scene-change detection when the canvas fills up. */
+typedef enum {
+    CANVAS_IFRAME = 0,   /* independent keyframe canvas */
+    CANVAS_PFRAME = 1    /* delta relative to parent keyframe canvas */
+} CanvasFrameType;
+
 /* ── DataType — automatic classification of clauses ──────
  * Decides how strongly RGB diffusion flows across the slot
  * boundary into neighbouring tiles. Prose chapters lean on
@@ -89,6 +107,14 @@ typedef struct {
     DataType  canvas_type;  /* set by the first placed clause; canvases
                                in a pool are typically type-homogeneous */
     SlotMeta  meta[CV_SLOTS];
+
+    /* I/P classification — filled by the pool's scene-change detector
+     * when the canvas becomes full. Unclassified canvases are treated
+     * as IFRAMEs with parent_canvas_id = UINT32_MAX. */
+    CanvasFrameType frame_type;
+    uint32_t        parent_canvas_id;   /* UINT32_MAX if IFRAME */
+    float           changed_ratio;      /* block fraction that changed */
+    int             classified;         /* 1 after scene_change_classify ran */
 } SpatialCanvas;
 
 /* Lifecycle */
@@ -112,6 +138,11 @@ void           canvas_update_rgb(SpatialCanvas* c);
 uint32_t       canvas_active_count(const SpatialCanvas* c);
 uint32_t       canvas_slot_byte_offset(uint32_t slot, uint32_t* out_x0,
                                        uint32_t* out_y0);
+
+/* Compute per-16×16-block A-channel sums over the entire canvas.
+ * Used for H.264-style scene-change detection. */
+void           canvas_compute_block_sums(const SpatialCanvas* c,
+                                          CanvasBlockSummary* out);
 
 /* Matching:
  *   Compare a 256×256 query grid against the tile occupying `slot`.

@@ -63,6 +63,8 @@
 #include "spatial_keyframe.h"
 #include "spatial_context.h"
 #include "spatial_generate.h"
+#include "spatial_canvas.h"
+#include "spatial_subtitle.h"
 #include "spatial_io.h"
 #include "bench_utf8.h"
 #include "bench_args.h"
@@ -245,40 +247,47 @@ static size_t decode_frame_range(const SpatialGrid* frame,
     return ol;
 }
 
-/* Extraction per user spec (SPEC §4 §5 §7 §9):
-     window = match ± radius  (B channel / horizontal clause order)
-     For each frame in the window we compute per-row A × R_sim × G_sim × B_sim
-     scores, pick the frame with highest Y-row score density, then emit its
-     best byte per row across the score-active Y range.
-   Uses SpatialAI keyframes (1-1 with clauses via ai_force_keyframe). */
-static void extract_answer(const SpatialAI* ai,
-                           uint32_t match_id,
-                           int radius,
-                           const InputSignature* q_sig,
-                           char* out, size_t cap) {
+/* Extraction over a pool window — operate on tile grids extracted from
+ * the SubtitleTrack entries ±radius around the matched entry.
+ * Preserves the SPEC §4 §5 §7 §9 scoring pipeline. */
+static void extract_answer_pool(SpatialCanvasPool* pool,
+                                uint32_t match_entry_id,
+                                int radius,
+                                const InputSignature* q_sig,
+                                char* out, size_t cap) {
     out[0] = '\0';
+    if (!pool || pool->track.count == 0) return;
 
-    int32_t w_start = (int32_t)match_id - radius; if (w_start < 0) w_start = 0;
-    int32_t w_end   = (int32_t)match_id + radius;
-    if (w_end >= (int32_t)ai->kf_count) w_end = (int32_t)ai->kf_count - 1;
+    int32_t w_start = (int32_t)match_entry_id - radius;
+    if (w_start < 0) w_start = 0;
+    int32_t w_end   = (int32_t)match_entry_id + radius;
+    if (w_end >= (int32_t)pool->track.count) w_end = (int32_t)pool->track.count - 1;
 
     double   best_density = -1.0;
-    uint32_t best_fid = match_id;
+    uint32_t best_eid = match_entry_id;
     uint32_t best_ys = 0, best_ye = 0;
+
+    /* Allocate reusable grid buffer for tile extraction */
+    SpatialGrid* tile = grid_create();
+    if (!tile) return;
 
     /* Pass 1: find global max density threshold to trim low-score tails */
     double global_max = 0.0;
-    for (int32_t fid = w_start; fid <= w_end; fid++) {
+    for (int32_t eid = w_start; eid <= w_end; eid++) {
+        const SubtitleEntry* e = &pool->track.entries[eid];
+        canvas_slot_to_grid(pool->canvases[e->canvas_id], e->slot_id, tile);
         double per_y[GRID_SIZE];
-        frame_y_scores(&ai->keyframes[fid].grid, q_sig, per_y);
+        frame_y_scores(tile, q_sig, per_y);
         for (uint32_t y = 0; y < GRID_SIZE; y++)
             if (per_y[y] > global_max) global_max = per_y[y];
     }
     double threshold = global_max * 0.25;
 
-    for (int32_t fid = w_start; fid <= w_end; fid++) {
+    for (int32_t eid = w_start; eid <= w_end; eid++) {
+        const SubtitleEntry* e = &pool->track.entries[eid];
+        canvas_slot_to_grid(pool->canvases[e->canvas_id], e->slot_id, tile);
         double per_y[GRID_SIZE];
-        frame_y_scores(&ai->keyframes[fid].grid, q_sig, per_y);
+        frame_y_scores(tile, q_sig, per_y);
 
         int32_t first = -1, last = -1;
         double total = 0;
@@ -295,19 +304,20 @@ static void extract_answer(const SpatialAI* ai,
         double density = total / (double)active_rows;
         if (density > best_density) {
             best_density = density;
-            best_fid = (uint32_t)fid;
+            best_eid = (uint32_t)eid;
             best_ys = (uint32_t)first;
             best_ye = (uint32_t)last;
         }
     }
 
+    const SubtitleEntry* be = &pool->track.entries[best_eid];
+    canvas_slot_to_grid(pool->canvases[be->canvas_id], be->slot_id, tile);
     if (best_density <= 0.0) {
-        grid_decode_text(&ai->keyframes[match_id].grid, out, (uint32_t)cap);
-        return;
+        grid_decode_text(tile, out, (uint32_t)cap);
+    } else {
+        decode_frame_range(tile, q_sig, best_ys, best_ye, out, cap);
     }
-
-    decode_frame_range(&ai->keyframes[best_fid].grid, q_sig,
-                       best_ys, best_ye, out, cap);
+    grid_destroy(tile);
 }
 
 /* ── Evaluation: normalization, EM, F1 ── */
@@ -503,10 +513,12 @@ int main(int argc, char* argv[]) {
         ai = spatial_ai_create();
     }
 
+    SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
+
     if (!ba.load_only) {
-        /* Store every unique context as consecutive force-keyframes.
-           ai_force_keyframe bypasses the delta decision so each clause
-           gets its own keyframe with a stable id → clause id == kf_id. */
+        /* Store every unique context via pool_add_clause. Same-type
+         * clauses cluster on the same canvas; clause_start/count now
+         * indexes into the subtitle track (not SpatialAI keyframes). */
         uint32_t total_clauses = 0;
         char split_buf[MAX_CLAUSES][MAX_LINE_LEN];
 
@@ -514,20 +526,29 @@ int main(int argc, char* argv[]) {
             if (contexts[ci].trained) continue;
             uint32_t n_cl = split_clauses(contexts[ci].text, split_buf, MAX_CLAUSES);
             if (n_cl == 0) continue;
-            contexts[ci].clause_start = ai->kf_count;
+            contexts[ci].clause_start = pool->track.count;
             contexts[ci].clause_count = n_cl;
             for (uint32_t k = 0; k < n_cl; k++) {
-                ai_force_keyframe(ai, split_buf[k], NULL);
+                pool_add_clause(pool, split_buf[k]);
                 total_clauses++;
             }
             contexts[ci].trained = 1;
             if ((ci + 1) % 50 == 0 || ci + 1 == n_contexts) {
-                printf("\r  Contexts: %d / %d, frames: %u",
-                       ci + 1, n_contexts, ai->kf_count);
+                printf("\r  Contexts: %d / %d, canvases: %u, slots: %u",
+                       ci + 1, n_contexts, pool->count, pool_total_slots(pool));
             }
         }
-        printf("\n  Stored %u context clauses as %u keyframes\n",
-               total_clauses, ai->kf_count);
+        /* Run canvas-level RGB diffusion once all slots are placed */
+        for (uint32_t i = 0; i < pool->count; i++)
+            canvas_update_rgb(pool->canvases[i]);
+        uint32_t n_kf = 0, n_df = 0;
+        for (uint32_t i = 0; i < pool->count; i++) {
+            if (!pool->canvases[i]->classified) continue;
+            if (pool->canvases[i]->frame_type == CANVAS_IFRAME) n_kf++;
+            else n_df++;
+        }
+        printf("\n  Stored %u clauses on %u canvases (KF=%u, Delta=%u)\n",
+               total_clauses, pool->count, n_kf, n_df);
     }
 
     double t_store = now_sec() - t0;
@@ -577,19 +598,20 @@ int main(int argc, char* argv[]) {
         update_rgb_directional(q_grid);
         input_signature_compute(&q_sig, q_grid);
 
-        /* 2. Cascade match: A → R×G → B×A (CASCADE_QA) */
-        float match_sim;
-        uint32_t best_fid = match_cascade(ai, q_grid, CASCADE_QA, &match_sim);
+        /* 2. Pool match: type jump → A → RG → BA → other */
+        PoolMatchResult pr = pool_match(pool, q_grid, qa[idx].question);
+        uint32_t best_entry = pr.subtitle_entry_id;
+        float match_sim = pr.similarity;
 
-        /* 3. Context retrieval hit: best_fid in [clause_start, clause_start+count) */
-        int ctx_hit = (best_fid >= gold_ctx->clause_start &&
-                       best_fid <  gold_ctx->clause_start + gold_ctx->clause_count);
+        /* 3. Context retrieval hit: best_entry in [clause_start, clause_start+count) */
+        int ctx_hit = (best_entry >= gold_ctx->clause_start &&
+                       best_entry <  gold_ctx->clause_start + gold_ctx->clause_count);
         if (ctx_hit) ctx_hits++;
 
-        /* 4. Extract answer via B*G*R over window of ai->keyframes */
+        /* 4. Extract answer over the pool window */
         char pred_ans[1024];
-        extract_answer(ai, best_fid, WINDOW_RADIUS, &q_sig,
-                       pred_ans, sizeof(pred_ans));
+        extract_answer_pool(pool, best_entry, WINDOW_RADIUS, &q_sig,
+                            pred_ans, sizeof(pred_ans));
 
         /* 5. EM / F1 */
         int em = compute_em(pred_ans, qa[idx].answer);
@@ -634,7 +656,17 @@ int main(int argc, char* argv[]) {
     printf("  Train pairs:             %d\n", train_n);
     printf("  Test pairs:              %d  (answered: %d)\n", test_n, answered);
     printf("  Unique contexts:         %d\n", n_contexts);
-    printf("  Context keyframes:       %u\n\n", ai->kf_count);
+    {
+        uint32_t n_kf = 0, n_df = 0;
+        for (uint32_t i = 0; i < pool->count; i++) {
+            if (!pool->canvases[i]->classified) continue;
+            if (pool->canvases[i]->frame_type == CANVAS_IFRAME) n_kf++;
+            else n_df++;
+        }
+        printf("  Canvases (KF/Delta):     %u (KF=%u, Delta=%u)\n",
+               pool->count, n_kf, n_df);
+        printf("  Pool slots:              %u\n\n", pool_total_slots(pool));
+    }
 
     if (answered > 0) {
         double ctx_acc = 100.0 * ctx_hits / answered;

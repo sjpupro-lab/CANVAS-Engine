@@ -199,6 +199,16 @@ static SpaiStatus write_canvas_record(FILE* fp, const SpatialCanvas* c) {
     if (fwrite(&c->slot_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
     if (fwrite(&stype,         sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
 
+    /* I/P metadata (v3.1) */
+    uint32_t ft  = (uint32_t)c->frame_type;
+    uint32_t pid = c->parent_canvas_id;
+    float    cr  = c->changed_ratio;
+    uint32_t cls = (uint32_t)c->classified;
+    if (fwrite(&ft,  4, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&pid, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&cr,  4, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&cls, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+
     /* Serialize SlotMeta as explicit fields to avoid struct padding issues */
     for (uint32_t s = 0; s < CV_SLOTS; s++) {
         uint32_t t = (uint32_t)c->meta[s].type;
@@ -224,6 +234,18 @@ static SpaiStatus read_canvas_body(FILE* fp, SpatialCanvas* c) {
     if (fread(&c->slot_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
     if (fread(&stype,         sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
     c->canvas_type = (DataType)stype;
+
+    /* I/P metadata (v3.1) */
+    uint32_t ft = 0, pid = UINT32_MAX, cls = 0;
+    float    cr = 0.0f;
+    if (fread(&ft,  4, 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&pid, 4, 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&cr,  4, 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&cls, 4, 1, fp) != 1) return SPAI_ERR_READ;
+    c->frame_type = (CanvasFrameType)ft;
+    c->parent_canvas_id = pid;
+    c->changed_ratio = cr;
+    c->classified = (int)cls;
 
     for (uint32_t s = 0; s < CV_SLOTS; s++) {
         uint32_t t = 0, bl = 0, th = 0, oc = 0;

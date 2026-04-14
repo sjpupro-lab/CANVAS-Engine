@@ -42,6 +42,11 @@ typedef struct {
 
 /* Allocate + build aggregated tables from all stored keyframes */
 AggTables* agg_build(const SpatialAI* ai);
+/* Build aggregated tables from all slots in a canvas pool. Tile-local
+ * (y, x) coordinates are used so candidates scored afterwards index
+ * naturally into the 256×256 space. */
+struct SpatialCanvasPool_;
+AggTables* agg_build_from_pool(const struct SpatialCanvasPool_* pool);
 void       agg_destroy(AggTables* t);
 
 /* ── Context signature from an input grid ────────────────

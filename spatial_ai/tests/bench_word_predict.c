@@ -42,6 +42,8 @@
 #include "spatial_match.h"
 #include "spatial_keyframe.h"
 #include "spatial_generate.h"
+#include "spatial_canvas.h"
+#include "spatial_subtitle.h"
 #include "spatial_io.h"
 #include "bench_utf8.h"
 #include "bench_args.h"
@@ -338,21 +340,28 @@ int main(int argc, char* argv[]) {
     uint32_t vcount = 0;
     WordSpan words[256];
 
+    SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
+
     if (!ba.load_only) {
         for (uint32_t c = 0; c < train_count; c++) {
-            /* ai_store_auto internally runs layers_encode_clause + update_rgb_directional
-               → keyframes end up with *diffused* R/G/B channels */
-            ai_store_auto(ai, clauses[c], NULL);
+            /* pool_add_clause stores into a type-matching canvas and
+             * runs layers_encode_clause (which seeds the B-channel
+             * co-occurrence hash). Canvas-wide RGB diffusion runs
+             * once after training (below). */
+            pool_add_clause(pool, clauses[c]);
 
             uint32_t nw = extract_words(clauses[c], words, 256);
             for (uint32_t w = 0; w < nw; w++) {
                 vocab_add(vocab, &vcount, MAX_VOCAB, words[w].text, words[w].len);
             }
             if ((c + 1) % 100 == 0 || c + 1 == train_count) {
-                printf("\r  Processed: %u / %u  (KF=%u Delta=%u vocab=%u)",
-                       c + 1, train_count, ai->kf_count, ai->df_count, vcount);
+                printf("\r  Processed: %u / %u  (canvases=%u, slots=%u vocab=%u)",
+                       c + 1, train_count, pool->count, pool_total_slots(pool), vcount);
             }
         }
+        /* Canvas-level RGB diffusion (cross-boundary effects) */
+        for (uint32_t i = 0; i < pool->count; i++)
+            canvas_update_rgb(pool->canvases[i]);
     } else {
         /* load-only: still need vocab for scoring → scan train split for words */
         printf("  --load-only: skipping training. Building vocab from text...\n");
@@ -383,12 +392,12 @@ int main(int argc, char* argv[]) {
     }
     printf("\n");
 
-    /* ── [3/5] Build aggregated RGBA tables ── */
-    printf("[3/5] Building aggregated A/R/G/B tables from %u keyframes...\n",
-           ai->kf_count);
+    /* ── [3/5] Build aggregated RGBA tables from the pool ── */
+    printf("[3/5] Building aggregated A/R/G/B tables from %u pool slots...\n",
+           pool_total_slots(pool));
     t0 = now_sec();
-    AggTables* agg = agg_build(ai);
-    if (!agg) { fprintf(stderr, "agg_build failed\n"); return 1; }
+    AggTables* agg = agg_build_from_pool(pool);
+    if (!agg) { fprintf(stderr, "agg_build_from_pool failed\n"); return 1; }
 
     /* active cells in aggregated A */
     uint32_t active_cells = 0;
@@ -453,19 +462,20 @@ int main(int argc, char* argv[]) {
             encode_masked(clauses[ci], target->offset, target->len, masked_grid);
             input_signature_compute(&sig, masked_grid);
 
-            /* ── CASCADE mode: use channel-cascade matching ── */
+            /* ── CASCADE mode: top-K pool match, extract bytes per slot ── */
             if (ba.cascade) {
-                uint32_t k = match_cascade_topk(ai, masked_grid, CASCADE_GENERATE,
-                                                5, cascade_ids, cascade_scores);
+                uint32_t k = pool_match_topk(pool, masked_grid,
+                                             5, cascade_ids, cascade_scores);
                 if (k == 0) continue;
 
-                /* Extract candidate word from each top-K keyframe:
-                   for each Y in [target.offset .. target.offset+len), pick
-                   argmax-A byte in that keyframe row. */
+                /* Extract candidate word from each top-K pool slot. */
                 char pred[64];
+                SpatialGrid* kg = grid_create();
                 int is_top1 = 0, is_top5 = 0;
                 for (uint32_t r = 0; r < k; r++) {
-                    const SpatialGrid* kg = &ai->keyframes[cascade_ids[r]].grid;
+                    const SubtitleEntry* se = &pool->track.entries[cascade_ids[r]];
+                    canvas_slot_to_grid(pool->canvases[se->canvas_id],
+                                        se->slot_id, kg);
                     uint32_t pl = 0;
                     for (uint32_t i = 0; i < target->len && pl + 1 < sizeof(pred); i++) {
                         uint32_t y = (target->offset + i) % GRID_SIZE;
@@ -493,6 +503,7 @@ int main(int argc, char* argv[]) {
                 if (is_top5) top5_hits++;
                 total_preds++;
                 any_in_clause = 1;
+                grid_destroy(kg);
                 continue;
             }
 

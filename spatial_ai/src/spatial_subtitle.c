@@ -88,6 +88,18 @@ const uint32_t* subtitle_track_ids_of_type(const SubtitleTrack* t,
     return t->by_type[(uint32_t)type];
 }
 
+int32_t subtitle_track_find(const SubtitleTrack* t,
+                            uint32_t canvas_id, uint32_t slot_id) {
+    if (!t) return -1;
+    for (uint32_t i = 0; i < t->count; i++) {
+        if (t->entries[i].canvas_id == canvas_id &&
+            t->entries[i].slot_id == slot_id) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
 /* ── Slot-level scoring primitives ─────────────────────── */
 
 float canvas_slot_cosine_a(const SpatialCanvas* c, uint32_t slot,
@@ -157,6 +169,83 @@ float canvas_slot_ba_score(const SpatialCanvas* c, uint32_t slot,
 
 /* ── SpatialCanvasPool ─────────────────────────────────── */
 
+/* ── H.264-style scene change classification ────────────── */
+
+void scene_change_init(SceneChangeState* s) {
+    if (!s) return;
+    s->threshold_ema = 0.0f;
+    s->n_samples = 0;
+}
+
+CanvasFrameType scene_change_classify(
+    const SpatialCanvas* candidate,
+    SpatialCanvas* const* refs, uint32_t n_refs,
+    SceneChangeState* state,
+    uint32_t* out_best_ref_id, float* out_changed_ratio)
+{
+    if (!candidate) return CANVAS_IFRAME;
+    if (n_refs == 0) {
+        /* First canvas of this type — always IFRAME */
+        if (out_best_ref_id) *out_best_ref_id = UINT32_MAX;
+        if (out_changed_ratio) *out_changed_ratio = 1.0f;
+        return CANVAS_IFRAME;
+    }
+
+    CanvasBlockSummary cand;
+    canvas_compute_block_sums(candidate, &cand);
+
+    /* Find the closest reference by total absolute block-sum difference
+     * (Sum of Absolute Differences). */
+    uint32_t best_ref = 0;
+    uint64_t min_sad = UINT64_MAX;
+    for (uint32_t r = 0; r < n_refs; r++) {
+        CanvasBlockSummary ref;
+        canvas_compute_block_sums(refs[r], &ref);
+        uint64_t sad = 0;
+        for (uint32_t b = 0; b < CV_BLOCKS_TOTAL; b++) {
+            uint32_t d = (cand.sums[b] > ref.sums[b])
+                       ? (cand.sums[b] - ref.sums[b])
+                       : (ref.sums[b] - cand.sums[b]);
+            sad += d;
+        }
+        if (sad < min_sad) { min_sad = sad; best_ref = r; }
+    }
+
+    /* Count blocks that changed significantly vs the closest reference.
+     * "Significantly" = above the EMA-tracked typical diff. */
+    CanvasBlockSummary ref;
+    canvas_compute_block_sums(refs[best_ref], &ref);
+
+    double mean_diff = 0.0;
+    uint32_t changed = 0;
+    for (uint32_t b = 0; b < CV_BLOCKS_TOTAL; b++) {
+        uint32_t d = (cand.sums[b] > ref.sums[b])
+                   ? (cand.sums[b] - ref.sums[b])
+                   : (ref.sums[b] - cand.sums[b]);
+        mean_diff += (double)d;
+        if ((float)d > state->threshold_ema) changed++;
+    }
+    mean_diff /= (double)CV_BLOCKS_TOTAL;
+
+    /* Update EMA with this canvas's mean block diff */
+    if (state->n_samples == 0) {
+        state->threshold_ema = (float)mean_diff;
+    } else {
+        state->threshold_ema =
+            SCENE_CHANGE_ALPHA * (float)mean_diff +
+            (1.0f - SCENE_CHANGE_ALPHA) * state->threshold_ema;
+    }
+    state->n_samples++;
+
+    float ratio = (float)changed / (float)CV_BLOCKS_TOTAL;
+    if (out_best_ref_id) *out_best_ref_id = best_ref;
+    if (out_changed_ratio) *out_changed_ratio = ratio;
+
+    return (ratio > SCENE_CHANGE_IFRAME_RATIO) ? CANVAS_IFRAME : CANVAS_PFRAME;
+}
+
+/* ── Pool lifecycle ───────────────────────────────────── */
+
 SpatialCanvasPool* pool_create(void) {
     SpatialCanvasPool* p = (SpatialCanvasPool*)calloc(1, sizeof(SpatialCanvasPool));
     if (!p) return NULL;
@@ -164,6 +253,7 @@ SpatialCanvasPool* pool_create(void) {
     p->count = 0;
     p->capacity = 0;
     subtitle_track_init(&p->track);
+    scene_change_init(&p->scene);
     return p;
 }
 
@@ -226,6 +316,48 @@ int pool_add_clause(SpatialCanvasPool* p, const char* text) {
     uint32_t th = c->meta[slot].topic_hash;
     uint32_t entry_id = subtitle_track_add(&p->track, type, th,
                                            (uint32_t)cvi, (uint32_t)slot, len);
+
+    /* If this placement filled the canvas, run scene-change classification
+     * so future matching / compression can rely on I/P labels. */
+    if (c->slot_count == CV_SLOTS && !c->classified) {
+        /* Gather same-type IFRAME canvases (excluding the candidate). */
+        SpatialCanvas** refs = (SpatialCanvas**)malloc(p->count * sizeof(SpatialCanvas*));
+        uint32_t n_refs = 0;
+        for (uint32_t i = 0; i < p->count; i++) {
+            if ((int32_t)i == cvi) continue;
+            SpatialCanvas* other = p->canvases[i];
+            if (!other) continue;
+            if (!other->classified) continue;
+            if (other->frame_type != CANVAS_IFRAME) continue;
+            if (other->canvas_type != c->canvas_type) continue;
+            refs[n_refs++] = other;
+        }
+        uint32_t best_ref_local = 0;
+        float ratio = 0.0f;
+        CanvasFrameType t = scene_change_classify(c, refs, n_refs, &p->scene,
+                                                  &best_ref_local, &ratio);
+        c->frame_type = t;
+        c->changed_ratio = ratio;
+        if (t == CANVAS_PFRAME && n_refs > 0) {
+            /* Map local ref index back to pool canvas index */
+            uint32_t local = 0;
+            for (uint32_t i = 0; i < p->count; i++) {
+                if ((int32_t)i == cvi) continue;
+                SpatialCanvas* other = p->canvases[i];
+                if (!other || !other->classified) continue;
+                if (other->frame_type != CANVAS_IFRAME) continue;
+                if (other->canvas_type != c->canvas_type) continue;
+                if (local == best_ref_local) {
+                    c->parent_canvas_id = i;
+                    break;
+                }
+                local++;
+            }
+        }
+        c->classified = 1;
+        free(refs);
+    }
+
     return (int)entry_id;
 }
 
@@ -362,8 +494,47 @@ PoolMatchResult pool_match(SpatialCanvasPool* p,
 
     /* If fallback found something, return it; otherwise return
        within-type result (even if weak) so caller has an answer. */
-    if (best_fb.similarity > within.similarity) {
-        return best_fb;
+    PoolMatchResult chosen = (best_fb.similarity > within.similarity) ? best_fb : within;
+    /* Resolve subtitle entry id for the chosen slot */
+    int32_t eid = subtitle_track_find(&p->track, chosen.canvas_id, chosen.slot_id);
+    chosen.subtitle_entry_id = (eid >= 0) ? (uint32_t)eid : 0;
+    return chosen;
+}
+
+/* ── Top-K across all entries ─────────────────────────── */
+
+uint32_t pool_match_topk(SpatialCanvasPool* p,
+                         const SpatialGrid* query,
+                         uint32_t k,
+                         uint32_t* out_entry_ids,
+                         float* out_scores) {
+    if (!p || !query || !out_entry_ids || !out_scores || k == 0) return 0;
+    uint32_t n = p->track.count;
+    if (n == 0) return 0;
+    if (k > n) k = n;
+
+    typedef struct { uint32_t id; float sim; } Pair;
+    Pair* arr = (Pair*)malloc(n * sizeof(Pair));
+    if (!arr) return 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const SubtitleEntry* e = &p->track.entries[i];
+        arr[i].id = i;
+        arr[i].sim = canvas_slot_cosine_a(p->canvases[e->canvas_id],
+                                          e->slot_id, query);
     }
-    return within;
+    /* Selection sort top-K in place */
+    for (uint32_t i = 0; i < k; i++) {
+        uint32_t max_i = i;
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (arr[j].sim > arr[max_i].sim) max_i = j;
+        }
+        if (max_i != i) { Pair tmp = arr[i]; arr[i] = arr[max_i]; arr[max_i] = tmp; }
+    }
+    for (uint32_t i = 0; i < k; i++) {
+        out_entry_ids[i] = arr[i].id;
+        out_scores[i]    = arr[i].sim;
+    }
+    free(arr);
+    return k;
 }

@@ -102,6 +102,11 @@ SpatialCanvas* canvas_create(void) {
         c->meta[s].topic_hash = 0;
         c->meta[s].occupied = 0;
     }
+    /* I/P defaults — unclassified canvas treated as IFRAME with no parent */
+    c->frame_type = CANVAS_IFRAME;
+    c->parent_canvas_id = UINT32_MAX;
+    c->changed_ratio = 0.0f;
+    c->classified = 0;
     return c;
 }
 
@@ -128,6 +133,10 @@ void canvas_clear(SpatialCanvas* c) {
         c->meta[s].topic_hash = 0;
         c->meta[s].occupied = 0;
     }
+    c->frame_type = CANVAS_IFRAME;
+    c->parent_canvas_id = UINT32_MAX;
+    c->changed_ratio = 0.0f;
+    c->classified = 0;
 }
 
 /* ── Slot → canvas-space coordinate helpers ────────────── */
@@ -271,6 +280,24 @@ uint32_t canvas_active_count(const SpatialCanvas* c) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < CV_TOTAL; i++) if (c->A[i] > 0) n++;
     return n;
+}
+
+void canvas_compute_block_sums(const SpatialCanvas* c, CanvasBlockSummary* out) {
+    if (!c || !out) return;
+    memset(out->sums, 0, sizeof(out->sums));
+    for (uint32_t by = 0; by < CV_BLOCKS_Y; by++) {
+        for (uint32_t bx = 0; bx < CV_BLOCKS_X; bx++) {
+            uint32_t s = 0;
+            for (uint32_t dy = 0; dy < CV_BLOCK; dy++) {
+                for (uint32_t dx = 0; dx < CV_BLOCK; dx++) {
+                    uint32_t ci = (by * CV_BLOCK + dy) * CV_WIDTH
+                                 + (bx * CV_BLOCK + dx);
+                    s += c->A[ci];
+                }
+            }
+            out->sums[by * CV_BLOCKS_X + bx] = s;
+        }
+    }
 }
 
 /* ── Slot → grid export ────────────────────────────────── */

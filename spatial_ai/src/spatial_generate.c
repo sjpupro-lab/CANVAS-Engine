@@ -3,6 +3,8 @@
 #include "spatial_morpheme.h"
 #include "spatial_match.h"
 #include "spatial_context.h"
+#include "spatial_canvas.h"
+#include "spatial_subtitle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +34,52 @@ AggTables* agg_build(const SpatialAI* ai) {
 
     /* Finalize: divide weighted sums by A_sum to get means;
        compute per-row activation totals. */
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        double row = 0.0;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (t->A_sum[i] > 0.0) {
+                t->R_mean[i] /= t->A_sum[i];
+                t->G_mean[i] /= t->A_sum[i];
+                t->B_mean[i] /= t->A_sum[i];
+            }
+            row += t->A_sum[i];
+        }
+        t->row_total_A[y] = row;
+    }
+    return t;
+}
+
+AggTables* agg_build_from_pool(const struct SpatialCanvasPool_* pool) {
+    if (!pool) return NULL;
+    AggTables* t = (AggTables*)calloc(1, sizeof(AggTables));
+    if (!t) return NULL;
+
+    /* Iterate every populated slot in every canvas, aggregating into
+     * tile-local (y, x) coordinates. This mirrors agg_build but with
+     * pool as the source of training patterns. */
+    for (uint32_t ei = 0; ei < pool->track.count; ei++) {
+        const SubtitleEntry* e = &pool->track.entries[ei];
+        const SpatialCanvas* c = pool->canvases[e->canvas_id];
+        uint32_t x0, y0;
+        canvas_slot_byte_offset(e->slot_id, &x0, &y0);
+
+        for (uint32_t dy = 0; dy < GRID_SIZE; dy++) {
+            for (uint32_t dx = 0; dx < GRID_SIZE; dx++) {
+                uint32_t ti = dy * GRID_SIZE + dx;
+                uint32_t ci = (y0 + dy) * CV_WIDTH + (x0 + dx);
+                uint16_t a = c->A[ci];
+                if (a == 0) continue;
+                double da = (double)a;
+                t->A_sum [ti] += da;
+                t->R_mean[ti] += da * (double)c->R[ci];
+                t->G_mean[ti] += da * (double)c->G[ci];
+                t->B_mean[ti] += da * (double)c->B[ci];
+            }
+        }
+    }
+
+    /* Finalise means */
     for (uint32_t y = 0; y < GRID_SIZE; y++) {
         double row = 0.0;
         for (uint32_t x = 0; x < GRID_SIZE; x++) {
