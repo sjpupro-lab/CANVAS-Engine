@@ -132,11 +132,11 @@ void layers_encode_clause(const char* clause_text,
     /* Layer 1: Base layer — all bytes, weight +1 */
     layer_encode_bytes(bytes, len, lb->base, 1);
 
-    /* Layer 2: Word layer — space-separated words, weight +2 */
-    layer_encode_words(clause_text, lb->word, 2);
+    /* Layer 2: Word layer — space-separated words, weight +5 */
+    layer_encode_words(clause_text, lb->word, 5);
 
-    /* Layer 3: Morpheme layer — morpheme tokens, weight +1 */
-    layer_encode_morphemes(clause_text, lb->morpheme, 1);
+    /* Layer 3: Morpheme layer — morpheme tokens, weight +3 */
+    layer_encode_morphemes(clause_text, lb->morpheme, 3);
 
     /* Sum into combined grid: A = base + word + morpheme */
     grid_clear(out_combined);

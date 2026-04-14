@@ -296,7 +296,8 @@ int main(int argc, char* argv[]) {
         if (r.similarity <  0.10f) low_matches++;
 
         int b = (int)(r.similarity * 10.0f);
-        if (b < 0) b = 0; if (b > 9) b = 9;
+        if (b < 0) b = 0;
+        if (b > 9) b = 9;
         hist[b]++;
 
         if (r.step_taken >= 1 && r.step_taken <= 4) step_counts[r.step_taken]++;
@@ -354,6 +355,46 @@ int main(int argc, char* argv[]) {
            pool->scene.threshold_ema, pool->scene.n_samples);
     printf("\n");
 
+    /* 3-layer brightness diagnostics: verify the new 1/3/5 weighting
+       appears in effective A distributions (1 / 4 / 6 / 9). */
+    uint64_t a_active = 0, a_total = 0, a_non_base = 0;
+    uint64_t a_1 = 0, a_4 = 0, a_6 = 0, a_9 = 0;
+    SpatialGrid* dg = grid_create();
+    for (uint32_t e = 0; e < pool->track.count; e++) {
+        const SubtitleEntry* se = &pool->track.entries[e];
+        canvas_slot_to_grid(pool->canvases[se->canvas_id], se->slot_id, dg);
+        for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+            uint16_t a = dg->A[i];
+            if (a == 0) continue;
+            a_active++;
+            a_total += a;
+            if (a > 1) a_non_base += (uint64_t)(a - 1);
+            if (a == 1) a_1++;
+            else if (a == 4) a_4++;
+            else if (a == 6) a_6++;
+            else if (a == 9) a_9++;
+        }
+    }
+    grid_destroy(dg);
+
+    double avg_a = (a_active > 0) ? ((double)a_total / (double)a_active) : 0.0;
+    uint64_t a_diag = a_1 + a_4 + a_6 + a_9;
+
+    printf("  3-LAYER BRIGHTNESS DIAGNOSTICS\n");
+    printf("  ─────────────────────────────────────\n");
+    printf("  Active cells:      %llu\n", (unsigned long long)a_active);
+    printf("  Avg A:             %.3f\n", avg_a);
+    printf("  A=1:               %llu\n", (unsigned long long)a_1);
+    printf("  A=4:               %llu\n", (unsigned long long)a_4);
+    printf("  A=6:               %llu\n", (unsigned long long)a_6);
+    printf("  A=9:               %llu\n", (unsigned long long)a_9);
+    printf("  Non-base contrib:  %llu\n", (unsigned long long)a_non_base);
+    if (a_active > 0) {
+        printf("  Tier coverage:     %.1f%%  (A in {1,4,6,9})\n",
+               100.0 * (double)a_diag / (double)a_active);
+    }
+    printf("\n");
+
     /* Type distribution per DataType */
     printf("  TYPE DISTRIBUTION\n");
     printf("  ─────────────────────────────────────\n");
@@ -380,6 +421,65 @@ int main(int argc, char* argv[]) {
     }
     if (pool->count > 20) printf("  ... (%u more)\n", pool->count - 20);
     printf("\n");
+
+    printf("  DELTA / COMPRESSION DIAGNOSTICS\n");
+    printf("  ─────────────────────────────────────\n");
+    if (n_pframe == 0) {
+        printf("  Delta canvases:    0\n\n");
+    } else {
+        CanvasDeltaEntry* tmp_delta =
+            (CanvasDeltaEntry*)malloc((size_t)CV_TOTAL * sizeof(CanvasDeltaEntry));
+        if (!tmp_delta) {
+            printf("  Delta diagnostics: skipped (alloc failed)\n\n");
+        } else {
+            uint64_t total_changed = 0;
+            uint64_t total_sparse_bytes = 0;
+            uint64_t total_rle_bytes = 0;
+            uint64_t total_full_a_bytes = 0;
+            double   ratio_sum = 0.0;
+            uint32_t ratio_n = 0;
+
+            for (uint32_t i = 0; i < pool->count; i++) {
+                SpatialCanvas* c = pool->canvases[i];
+                if (!c->classified || c->frame_type != CANVAS_PFRAME) continue;
+                if (c->parent_canvas_id == UINT32_MAX || c->parent_canvas_id >= pool->count)
+                    continue;
+
+                SpatialCanvas* p = pool->canvases[c->parent_canvas_id];
+                uint32_t changed = canvas_delta_sparse(p, c, tmp_delta, CV_TOTAL);
+                uint32_t rle_bytes = canvas_delta_rle_bytes(tmp_delta, changed);
+
+                total_changed += changed;
+                total_sparse_bytes += (uint64_t)changed * 6ull;
+                total_rle_bytes += (uint64_t)rle_bytes;
+                total_full_a_bytes += (uint64_t)CV_TOTAL * (uint64_t)sizeof(uint16_t);
+                ratio_sum += c->changed_ratio;
+                ratio_n++;
+            }
+
+            double saved_vs_full = 0.0;
+            double saved_vs_sparse = 0.0;
+            if (total_full_a_bytes > 0) {
+                saved_vs_full = 100.0 * (1.0 - (double)total_rle_bytes / (double)total_full_a_bytes);
+            }
+            if (total_sparse_bytes > 0) {
+                saved_vs_sparse = 100.0 * (1.0 - (double)total_rle_bytes / (double)total_sparse_bytes);
+            }
+
+            printf("  Delta canvases:    %u\n", n_pframe);
+            printf("  Changed cells:     %llu\n", (unsigned long long)total_changed);
+            printf("  change_ratio avg:  %.2f%%\n",
+                   (ratio_n > 0) ? (100.0 * ratio_sum / (double)ratio_n) : 0.0);
+            printf("  Full A bytes:      %llu\n", (unsigned long long)total_full_a_bytes);
+            printf("  Sparse bytes:      %llu\n", (unsigned long long)total_sparse_bytes);
+            printf("  RLE bytes:         %llu\n", (unsigned long long)total_rle_bytes);
+            printf("  Saved vs full A:   %.1f%%\n", saved_vs_full);
+            printf("  Saved vs sparse:   %.1f%%\n", saved_vs_sparse);
+            printf("\n");
+
+            free(tmp_delta);
+        }
+    }
 
     float avg_sim = (clause_count > 0) ? (float)(sim_sum / clause_count) : 0.0f;
     printf("  MATCHING (pool_match self-query)\n");

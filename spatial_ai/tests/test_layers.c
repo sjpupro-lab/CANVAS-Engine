@@ -51,21 +51,21 @@ static void test_3layer_summation(void) {
     PASS();
 }
 
-static void test_max_brightness_4(void) {
-    TEST("max brightness can reach 4");
+static void test_max_brightness_9(void) {
+    TEST("max brightness can reach 9");
     SpatialGrid* combined = grid_create();
 
     morpheme_init();
 
-    /* "밥을" — 밥 is a noun, so base(+1) + word(+2) + morpheme(+1) = 4 */
+    /* "밥을" — overlap can reach base(+1) + word(+5) + morpheme(+3) = 9 */
     layers_encode_clause(
         "\xeb\xb0\xa5\xec\x9d\x84",
         NULL, combined);
 
     uint16_t max_b = grid_max_brightness(combined);
     printf("\n    max brightness = %u\n", max_b);
-    /* Should reach at least 3 (base + word overlap) */
-    assert(max_b >= 3);
+    /* Should reach at least 9 in the new weighting scheme */
+    assert(max_b >= 9);
 
     grid_destroy(combined);
     PASS();
@@ -87,7 +87,7 @@ int main(void) {
     printf("=== test_layers ===\n");
 
     test_3layer_summation();
-    test_max_brightness_4();
+    test_max_brightness_9();
     test_empty_input();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
