@@ -425,6 +425,15 @@ int main(int argc, char* argv[]) {
     /* Per-length temporary score buffer */
     double* tmp_scores = (double*)malloc(MAX_VOCAB * sizeof(double));
 
+    /* Cascade-mode scratch buffers */
+    uint32_t cascade_ids[64];
+    float    cascade_scores[64];
+
+    if (ba.cascade) {
+        printf("  [--cascade] match_cascade(CASCADE_GENERATE) +"
+               " keyframe-byte extraction\n");
+    }
+
     for (uint32_t t = 0; t < test_count; t++) {
         uint32_t ci = train_count + t;
         uint32_t nw = extract_words(clauses[ci], words, 256);
@@ -438,12 +447,56 @@ int main(int argc, char* argv[]) {
             if (true_idx < 0) { oov++; continue; }
 
             LengthBucket* b = &buckets[target->len];
-            if (b->count < 2) { continue; }  /* need candidates to rank */
+            if (b->count < 2) { continue; }
 
-            /* 1) Encode test clause with target word masked out.
-                  This gives the RGB context "without the target word". */
+            /* 1) Encode test clause with target word masked out. */
             encode_masked(clauses[ci], target->offset, target->len, masked_grid);
             input_signature_compute(&sig, masked_grid);
+
+            /* ── CASCADE mode: use channel-cascade matching ── */
+            if (ba.cascade) {
+                uint32_t k = match_cascade_topk(ai, masked_grid, CASCADE_GENERATE,
+                                                5, cascade_ids, cascade_scores);
+                if (k == 0) continue;
+
+                /* Extract candidate word from each top-K keyframe:
+                   for each Y in [target.offset .. target.offset+len), pick
+                   argmax-A byte in that keyframe row. */
+                char pred[64];
+                int is_top1 = 0, is_top5 = 0;
+                for (uint32_t r = 0; r < k; r++) {
+                    const SpatialGrid* kg = &ai->keyframes[cascade_ids[r]].grid;
+                    uint32_t pl = 0;
+                    for (uint32_t i = 0; i < target->len && pl + 1 < sizeof(pred); i++) {
+                        uint32_t y = (target->offset + i) % GRID_SIZE;
+                        uint32_t best_x = 0;
+                        uint16_t best_a = 0;
+                        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                            uint32_t idx = y * GRID_SIZE + x;
+                            if (kg->A[idx] > best_a) {
+                                best_a = kg->A[idx];
+                                best_x = x;
+                            }
+                        }
+                        pred[pl++] = (char)(uint8_t)best_x;
+                    }
+                    pred[pl] = '\0';
+
+                    if (pl == target->len &&
+                        memcmp(pred, target->text, target->len) == 0) {
+                        if (r == 0) is_top1 = 1;
+                        is_top5 = 1;
+                        break;
+                    }
+                }
+                if (is_top1) top1_hits++;
+                if (is_top5) top5_hits++;
+                total_preds++;
+                any_in_clause = 1;
+                continue;
+            }
+
+            /* ── Default mode: byte-position score_word over vocab ── */
 
             /* 2) Score every same-length vocab candidate */
             double max_lp = -1e300;
@@ -457,22 +510,17 @@ int main(int argc, char* argv[]) {
                 if ((int)vi == true_idx) true_lp = lp;
             }
 
-            /* Verify the true word had nonzero contribution.
-               If every byte of the true word scored zero (i.e., agg had no
-               evidence), flag as empty_candidates. */
             if (!isfinite(true_lp) || true_lp < -1e200) {
                 empty_candidates++;
                 continue;
             }
 
-            /* 3) Rank: count candidates strictly better than true */
             uint32_t rank = 0;
             for (uint32_t j = 0; j < b->count; j++) {
                 if (b->ids[j] == (uint32_t)true_idx) continue;
                 if (tmp_scores[j] > true_lp) rank++;
             }
 
-            /* 4) Softmax for perplexity (numerically stable) */
             double denom = 0.0;
             for (uint32_t j = 0; j < b->count; j++) {
                 denom += exp(tmp_scores[j] - max_lp);
@@ -495,6 +543,7 @@ int main(int argc, char* argv[]) {
 
     free(tmp_scores);
     grid_destroy(masked_grid);
+    (void)cascade_scores;  /* currently unused; reserved for score reporting */
 
     double t_pred = now_sec() - t0;
     printf("\n  Done in %.2f sec  (%.0f preds/sec)\n\n",

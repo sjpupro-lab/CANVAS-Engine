@@ -37,8 +37,10 @@ typedef struct {
     float        change_ratio;
 } DeltaFrame;
 
-/* Main AI engine structure */
-typedef struct {
+/* Main AI engine structure.
+ * Named struct (SpatialAI_) so spatial_match.h can forward-declare it
+ * for the cascade API without a circular include. */
+typedef struct SpatialAI_ {
     Keyframe*     keyframes;
     uint32_t      kf_count;
     uint32_t      kf_capacity;
@@ -56,6 +58,15 @@ void       spatial_ai_destroy(SpatialAI* ai);
 uint32_t ai_store_auto(SpatialAI* ai,
                        const char* clause_text,
                        const char* label);
+
+/* Always store a clause as a new keyframe, bypassing the delta
+   decision. Needed when callers require a 1-1 clause ↔ keyframe
+   mapping (e.g. context frames for QA retrieval).
+   Returns the new keyframe ID (== ai->kf_count - 1 on success),
+   or UINT32_MAX on failure. */
+uint32_t ai_force_keyframe(SpatialAI* ai,
+                           const char* clause_text,
+                           const char* label);
 
 /* Compute delta between two grids.
    Returns number of changed pixels. entries must be pre-allocated. */

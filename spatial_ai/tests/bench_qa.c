@@ -186,38 +186,9 @@ static int find_or_add_context(ContextEntry* ctxs, int* n, const char* text) {
     return (*n)++;
 }
 
-/* ── Matching over context frames — SPEC §9 2-stage pipeline ── */
-
-/* Stage 1: overlap coarse    — count co-active byte positions
-   Stage 2: RGB-weighted fine — score top-K candidates with cosine_rgb_weighted */
-static uint32_t match_context_frame(const ContextManager* cm,
-                                    const SpatialGrid* q,
-                                    float* out_sim) {
-    if (cm->frame_count == 0) { if (out_sim) *out_sim = 0.0f; return 0; }
-
-    uint32_t n = cm->frame_count;
-    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-
-    /* ── Stage 1: overlap coarse over every context frame ── */
-    for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
-        pool[i].score = (float)overlap_score(q, cm->frames[i].grid);
-    }
-    uint32_t k = (TOP_K < n) ? TOP_K : n;
-    topk_select(pool, n, k);
-
-    /* ── Stage 2: RGB-weighted cosine on top-K ── */
-    uint32_t best_id  = pool[0].id;
-    float    best_sim = -1.0f;
-    for (uint32_t i = 0; i < k; i++) {
-        float s = cosine_rgb_weighted(q, cm->frames[pool[i].id].grid);
-        if (s > best_sim) { best_sim = s; best_id = pool[i].id; }
-    }
-
-    free(pool);
-    if (out_sim) *out_sim = best_sim;
-    return best_id;
-}
+/* Matching is now handled by match_cascade(ai, q, CASCADE_QA) via the
+   AI's keyframes. Each context clause is stored with ai_force_keyframe
+   so clause ids map 1-1 to keyframe ids (no delta collapse). */
 
 /* ── Answer extraction: B × G × R over window ── */
 
@@ -274,12 +245,13 @@ static size_t decode_frame_range(const SpatialGrid* frame,
     return ol;
 }
 
-/* Extraction per user spec:
-     window  = match ± radius  (B channel / horizontal clause order)
+/* Extraction per user spec (SPEC §4 §5 §7 §9):
+     window = match ± radius  (B channel / horizontal clause order)
      For each frame in the window we compute per-row A × R_sim × G_sim × B_sim
      scores, pick the frame with highest Y-row score density, then emit its
-     best byte per row across the score-active Y range. */
-static void extract_answer(const ContextManager* cm,
+     best byte per row across the score-active Y range.
+   Uses SpatialAI keyframes (1-1 with clauses via ai_force_keyframe). */
+static void extract_answer(const SpatialAI* ai,
                            uint32_t match_id,
                            int radius,
                            const InputSignature* q_sig,
@@ -288,7 +260,7 @@ static void extract_answer(const ContextManager* cm,
 
     int32_t w_start = (int32_t)match_id - radius; if (w_start < 0) w_start = 0;
     int32_t w_end   = (int32_t)match_id + radius;
-    if (w_end >= (int32_t)cm->frame_count) w_end = (int32_t)cm->frame_count - 1;
+    if (w_end >= (int32_t)ai->kf_count) w_end = (int32_t)ai->kf_count - 1;
 
     double   best_density = -1.0;
     uint32_t best_fid = match_id;
@@ -298,17 +270,16 @@ static void extract_answer(const ContextManager* cm,
     double global_max = 0.0;
     for (int32_t fid = w_start; fid <= w_end; fid++) {
         double per_y[GRID_SIZE];
-        frame_y_scores(cm->frames[fid].grid, q_sig, per_y);
+        frame_y_scores(&ai->keyframes[fid].grid, q_sig, per_y);
         for (uint32_t y = 0; y < GRID_SIZE; y++)
             if (per_y[y] > global_max) global_max = per_y[y];
     }
-    double threshold = global_max * 0.25;  /* keep top 75% of peak density */
+    double threshold = global_max * 0.25;
 
     for (int32_t fid = w_start; fid <= w_end; fid++) {
         double per_y[GRID_SIZE];
-        frame_y_scores(cm->frames[fid].grid, q_sig, per_y);
+        frame_y_scores(&ai->keyframes[fid].grid, q_sig, per_y);
 
-        /* Contiguous Y range above threshold */
         int32_t first = -1, last = -1;
         double total = 0;
         int32_t active_rows = 0;
@@ -331,12 +302,11 @@ static void extract_answer(const ContextManager* cm,
     }
 
     if (best_density <= 0.0) {
-        /* Nothing scored above threshold — decode matched frame directly. */
-        grid_decode_text(cm->frames[match_id].grid, out, (uint32_t)cap);
+        grid_decode_text(&ai->keyframes[match_id].grid, out, (uint32_t)cap);
         return;
     }
 
-    decode_frame_range(cm->frames[best_fid].grid, q_sig,
+    decode_frame_range(&ai->keyframes[best_fid].grid, q_sig,
                        best_ys, best_ye, out, cap);
 }
 
@@ -515,7 +485,6 @@ int main(int argc, char* argv[]) {
     printf("[2/4] Storing unique contexts as consecutive frames via context_add_frame...\n");
     t0 = now_sec();
 
-    ContextManager* cm = context_create();
     SpatialAI*      ai = NULL;
     uint32_t loaded_kf = 0, loaded_df = 0;
 
@@ -535,10 +504,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (!ba.load_only) {
-        /* Store every unique context. Some QAs in the test split will
-           share contexts already stored by training split; that's
-           acceptable — we measure answer-extraction quality, not
-           context-level leakage. */
+        /* Store every unique context as consecutive force-keyframes.
+           ai_force_keyframe bypasses the delta decision so each clause
+           gets its own keyframe with a stable id → clause id == kf_id. */
         uint32_t total_clauses = 0;
         char split_buf[MAX_CLAUSES][MAX_LINE_LEN];
 
@@ -546,20 +514,20 @@ int main(int argc, char* argv[]) {
             if (contexts[ci].trained) continue;
             uint32_t n_cl = split_clauses(contexts[ci].text, split_buf, MAX_CLAUSES);
             if (n_cl == 0) continue;
-            contexts[ci].clause_start = cm->frame_count;
+            contexts[ci].clause_start = ai->kf_count;
             contexts[ci].clause_count = n_cl;
             for (uint32_t k = 0; k < n_cl; k++) {
-                context_add_frame(cm, ai, split_buf[k], NULL);
+                ai_force_keyframe(ai, split_buf[k], NULL);
                 total_clauses++;
             }
             contexts[ci].trained = 1;
             if ((ci + 1) % 50 == 0 || ci + 1 == n_contexts) {
                 printf("\r  Contexts: %d / %d, frames: %u",
-                       ci + 1, n_contexts, cm->frame_count);
+                       ci + 1, n_contexts, ai->kf_count);
             }
         }
-        printf("\n  Stored %u context clauses in %u frames\n",
-               total_clauses, cm->frame_count);
+        printf("\n  Stored %u context clauses as %u keyframes\n",
+               total_clauses, ai->kf_count);
     }
 
     double t_store = now_sec() - t0;
@@ -609,18 +577,18 @@ int main(int argc, char* argv[]) {
         update_rgb_directional(q_grid);
         input_signature_compute(&q_sig, q_grid);
 
-        /* 2. Match over ctx->frames */
+        /* 2. Cascade match: A → R×G → B×A (CASCADE_QA) */
         float match_sim;
-        uint32_t best_fid = match_context_frame(cm, q_grid, &match_sim);
+        uint32_t best_fid = match_cascade(ai, q_grid, CASCADE_QA, &match_sim);
 
         /* 3. Context retrieval hit: best_fid in [clause_start, clause_start+count) */
         int ctx_hit = (best_fid >= gold_ctx->clause_start &&
                        best_fid <  gold_ctx->clause_start + gold_ctx->clause_count);
         if (ctx_hit) ctx_hits++;
 
-        /* 4. Extract answer via B*G*R */
+        /* 4. Extract answer via B*G*R over window of ai->keyframes */
         char pred_ans[1024];
-        extract_answer(cm, best_fid, WINDOW_RADIUS, &q_sig,
+        extract_answer(ai, best_fid, WINDOW_RADIUS, &q_sig,
                        pred_ans, sizeof(pred_ans));
 
         /* 5. EM / F1 */
@@ -666,8 +634,7 @@ int main(int argc, char* argv[]) {
     printf("  Train pairs:             %d\n", train_n);
     printf("  Test pairs:              %d  (answered: %d)\n", test_n, answered);
     printf("  Unique contexts:         %d\n", n_contexts);
-    printf("  Context frames stored:   %u\n", cm->frame_count);
-    printf("  Keyframes (side-effect): %u\n\n", ai->kf_count);
+    printf("  Context keyframes:       %u\n\n", ai->kf_count);
 
     if (answered > 0) {
         double ctx_acc = 100.0 * ctx_hits / answered;
@@ -704,7 +671,6 @@ int main(int argc, char* argv[]) {
     free(contexts);
     for (int i = 0; i < n_qa; i++) { free(qa[i].question); free(qa[i].answer); }
     free(qa);
-    context_destroy(cm);
     spatial_ai_destroy(ai);
     return 0;
 }

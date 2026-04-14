@@ -27,6 +27,7 @@ typedef struct {
     const char* save_path;
     const char* load_path;
     int         load_only;   /* 0 or 1 */
+    int         cascade;     /* 0 or 1 — enables cascade matching mode */
 } BenchArgs;
 
 static inline void bench_args_init(BenchArgs* a) {
@@ -34,6 +35,7 @@ static inline void bench_args_init(BenchArgs* a) {
     a->save_path = NULL;
     a->load_path = NULL;
     a->load_only = 0;
+    a->cascade   = 0;
 }
 
 /* Returns 0 on success, -1 on bad arguments (missing value after a flag
@@ -54,6 +56,8 @@ static inline int bench_parse_args(int argc, char** argv, BenchArgs* a) {
             if (i + 1 >= argc) return -1;
             a->load_path = argv[++i];
             a->load_only = 1;
+        } else if (strcmp(cur, "--cascade") == 0) {
+            a->cascade = 1;
         } else if (cur[0] == '-' && cur[1] == '-') {
             /* Unknown long flag — skip it and its value if present */
             if (i + 1 < argc && argv[i + 1][0] != '-') i++;

@@ -227,6 +227,31 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
     }
 }
 
+uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* label) {
+    if (!ai || !clause_text) return UINT32_MAX;
+
+    SpatialGrid* input = grid_create();
+    if (!input) return UINT32_MAX;
+
+    morpheme_init();
+    layers_encode_clause(clause_text, NULL, input);
+    update_rgb_directional(input);
+
+    if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
+
+    uint32_t new_id = ai->kf_count;
+    Keyframe* kf = &ai->keyframes[new_id];
+    kf->id = new_id;
+    if (label) strncpy(kf->label, label, 63);
+    kf->label[63] = '\0';
+    kf->text_byte_count = (uint32_t)strlen(clause_text);
+    keyframe_alloc_grid(kf, input);
+
+    ai->kf_count++;
+    grid_destroy(input);
+    return new_id;
+}
+
 uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity) {
     if (!ai || !input_text || ai->kf_count == 0) {
         if (out_similarity) *out_similarity = 0.0f;
