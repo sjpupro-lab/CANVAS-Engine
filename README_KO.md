@@ -1,5 +1,7 @@
 # SPATIAL-PATTERN-AI (CANVAS)
 
+![Main Hero](main_hero.png)
+
 > 텍스트를 256x256 픽셀 격자 위의 밝기 패턴으로 변환하여 학습하는 공간 패턴 기반 AI 엔진.
 > 언어를 토큰 벡터가 아닌, 영상 프레임처럼 취급합니다.
 
@@ -20,6 +22,8 @@
 ## 동작 원리
 
 ### 1. 3-레이어 비트맵 합산
+
+![3-Layer Summation](visualization_1.png)
 
 하나의 절을 3장의 독립 비트맵으로 인코딩한 뒤, 투명한 종이를 덧대듯 합산합니다.
 
@@ -64,6 +68,8 @@ R/G/B 값은 **고정 테이블이 아닙니다** — AI가 방향성 확산을 
 ```
 
 ### 3. 매칭 파이프라인
+
+![Hierarchical Matching](visualization_2.png)
 
 2단계 검색: 빠른 조대 필터 → 정밀 스코어링.
 
