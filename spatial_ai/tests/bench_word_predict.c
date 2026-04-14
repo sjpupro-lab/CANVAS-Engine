@@ -1,29 +1,35 @@
 /*
- * bench_word_predict.c — masked-word prediction benchmark
+ * bench_word_predict.c — masked word prediction via learned RGBA channels
  *
- * SPEC alignment:
- *   - Word layer (+2) captures word-level emphasis at each byte position.
- *   - G channel, diffused vertically (↑↓), captures word-substitution
- *     relationships — "words that can appear at the same Y position".
+ * SPEC-aligned generation (§4, §5, §9):
  *
- * Procedure:
- *   Training
- *     For every training clause:
- *       encode with 3-layer summation → track the word-layer bitmap only
- *       wcount[y][x] += word_layer[y][x]  (weight +2 at word bytes)
- *       vocab[word].freq++
+ *   Training diffused R/G/B directionally across every stored keyframe:
+ *     R  diagonals  → semantic/morpheme class
+ *     G  vertical   → word-substitution class
+ *     B  horizontal → clause-order class
  *
- *   Test
- *     For each held-out clause, mask one word W at byte offset s (length L).
- *     For every candidate w in the vocabulary with |w| == L:
- *       log P(w | s) = sum_{i=0..L-1} log P(byte = w[i] | y = (s+i) mod 256)
- *                    where P(byte=v|y) = (wcount[y][v] + eps) /
- *                                         (sum_x wcount[y][x] + 256*eps)
- *     Rank candidates by log P, check where the true W lands.
+ *   For each test clause we mask EVERY in-vocab word (no "longest word"
+ *   heuristic, no byte-frequency-only scoring). For each candidate
+ *   byte sequence w at offset s, length L:
+ *
+ *     byte_score(y, v) = A_sum[y, v]
+ *                      × (1 - |R_mean[y,v] - input_R_ctx[y]| / 255)
+ *                      × (1 - |G_mean[y,v] - input_G_ctx[y]| / 255)
+ *                      × (1 - |B_mean[y,v] - input_B_ctx[y]| / 255)
+ *
+ *     word_score(w)    = Π byte_score((s+i) mod 256, w[i])
+ *
+ *   All FOUR channels (A, R, G, B) are used — training learned all of
+ *   them, generation must consult all of them. Input_R/G/B_ctx comes
+ *   from the test clause with the target word masked so the candidate
+ *   is evaluated against the surrounding clause's RGBA signature.
  *
  * Metrics
- *   - Top-1 accuracy, Top-5 accuracy
- *   - Word-level perplexity = exp(- mean log P(W))
+ *   - Top-1 / Top-5 accuracy
+ *   - Word-level perplexity from softmax over same-length candidates
+ *
+ * Train/test split: 70% / 30% by clause index.
+ * No self-query: test words live in unseen test clauses.
  *
  * Usage
  *   ./build/bench_word_predict data/sample_ko.txt
@@ -34,6 +40,8 @@
 #include "spatial_layers.h"
 #include "spatial_morpheme.h"
 #include "spatial_match.h"
+#include "spatial_keyframe.h"
+#include "spatial_generate.h"
 #include "bench_utf8.h"
 
 #include <stdio.h>
@@ -46,12 +54,11 @@
 #define MAX_CLAUSES     10000
 #define MAX_LINE_LEN    4096
 #define MIN_CLAUSE_LEN  10
-#define MAX_VOCAB       5000
+#define MAX_VOCAB       8000
 #define MAX_WORD_LEN    64
-#define MIN_WORD_BYTES  3       /* skip 1-2 byte tokens */
-#define TEST_SPLIT      0.10f
+#define MIN_WORD_BYTES  3
+#define TRAIN_RATIO     0.70f
 #define DEFAULT_LIMIT   1000
-#define EPSILON         0.5
 
 static double now_sec(void) {
     struct timespec ts;
@@ -59,7 +66,7 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* ── Meta / clause helpers ── */
+/* ── text helpers ── */
 
 static int is_meta_line(const char* line) {
     while (*line == ' ' || *line == '\t') line++;
@@ -99,12 +106,10 @@ static uint32_t split_clauses(const char* line, char out[][MAX_LINE_LEN],
     return count;
 }
 
-/* ── Word extraction ── */
+/* ── word extraction ── */
 
 typedef struct { char text[MAX_WORD_LEN]; uint32_t offset; uint32_t len; } WordSpan;
 
-/* Extract whitespace-separated words from clause, with byte offsets.
-   Returns number of words. Skips punctuation at ends. */
 static uint32_t extract_words(const char* clause, WordSpan* out, uint32_t max) {
     uint32_t count = 0;
     uint32_t i = 0;
@@ -118,7 +123,7 @@ static uint32_t extract_words(const char* clause, WordSpan* out, uint32_t max) {
         while (i < len && clause[i] != ' ' && clause[i] != '\t') i++;
         uint32_t w_end = i;
 
-        /* Strip trailing punctuation */
+        /* strip trailing punctuation */
         while (w_end > w_start) {
             char c = clause[w_end - 1];
             if (c == '.' || c == ',' || c == '!' || c == '?' ||
@@ -127,7 +132,6 @@ static uint32_t extract_words(const char* clause, WordSpan* out, uint32_t max) {
                 w_end--;
             else break;
         }
-        /* Strip leading punctuation */
         while (w_start < w_end) {
             char c = clause[w_start];
             if (c == '(' || c == '[' || c == '"' || c == '\'') w_start++;
@@ -146,15 +150,16 @@ static uint32_t extract_words(const char* clause, WordSpan* out, uint32_t max) {
     return count;
 }
 
-/* ── Vocabulary ── */
+/* ── vocabulary ── */
 
 typedef struct {
     char     word[MAX_WORD_LEN];
-    uint32_t len;          /* byte length */
+    uint32_t len;
     uint32_t freq;
 } VocabEntry;
 
-static int vocab_find(VocabEntry* vocab, uint32_t vcount, const char* word, uint32_t wlen) {
+static int vocab_find(VocabEntry* vocab, uint32_t vcount,
+                      const char* word, uint32_t wlen) {
     for (uint32_t i = 0; i < vcount; i++) {
         if (vocab[i].len == wlen && memcmp(vocab[i].word, word, wlen) == 0)
             return (int)i;
@@ -165,10 +170,7 @@ static int vocab_find(VocabEntry* vocab, uint32_t vcount, const char* word, uint
 static int vocab_add(VocabEntry* vocab, uint32_t* vcount, uint32_t vmax,
                      const char* word, uint32_t wlen) {
     int idx = vocab_find(vocab, *vcount, word, wlen);
-    if (idx >= 0) {
-        vocab[idx].freq++;
-        return idx;
-    }
+    if (idx >= 0) { vocab[idx].freq++; return idx; }
     if (*vcount >= vmax) return -1;
     VocabEntry* e = &vocab[*vcount];
     memcpy(e->word, word, wlen);
@@ -179,7 +181,69 @@ static int vocab_add(VocabEntry* vocab, uint32_t* vcount, uint32_t vmax,
     return (int)(*vcount - 1);
 }
 
-/* ── main ── */
+/* ── per-length vocab index (for efficient same-length scoring) ── */
+
+typedef struct {
+    uint32_t* ids;    /* vocab indices */
+    uint32_t  count;
+    uint32_t  cap;
+} LengthBucket;
+
+static void lbuckets_build(LengthBucket* buckets, VocabEntry* vocab, uint32_t vcount) {
+    for (uint32_t i = 0; i < vcount; i++) {
+        uint32_t L = vocab[i].len;
+        if (L >= MAX_WORD_LEN) continue;
+        LengthBucket* b = &buckets[L];
+        if (b->count >= b->cap) {
+            b->cap = b->cap ? b->cap * 2 : 16;
+            b->ids = (uint32_t*)realloc(b->ids, b->cap * sizeof(uint32_t));
+        }
+        b->ids[b->count++] = i;
+    }
+}
+
+static void lbuckets_free(LengthBucket* buckets) {
+    for (uint32_t L = 0; L < MAX_WORD_LEN; L++) free(buckets[L].ids);
+}
+
+/* ── scoring a candidate word ─────────────────────────── */
+
+/* log score of word w at offset s. Higher = better.
+   Uses the aggregated training tables and the full RGBA input signature. */
+static double score_word(const AggTables* t, const InputSignature* sig,
+                         uint32_t s, const char* w, uint32_t len) {
+    double log_s = 0.0;
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t y = (s + i) % GRID_SIZE;
+        double in_R, in_G, in_B;
+        input_signature_get(sig, y, &in_R, &in_G, &in_B);
+        double bs = agg_score_byte(t, y, (uint8_t)w[i], in_R, in_G, in_B);
+        /* Laplace-style smoothing to allow comparison with unseen (y,v) cells */
+        log_s += log(bs + 1e-9);
+    }
+    return log_s;
+}
+
+/* ── masked-clause encoding ─────────────────────────────
+ * Build a copy of clause with bytes [mask_s..mask_s+mask_len) replaced
+ * by space, then encode + RGB-diffuse. This gives an input whose RGB
+ * signature reflects the clause WITHOUT the target word. */
+static void encode_masked(const char* clause, uint32_t mask_s, uint32_t mask_len,
+                          SpatialGrid* out) {
+    char buf[MAX_LINE_LEN];
+    uint32_t clen = (uint32_t)strlen(clause);
+    if (clen >= MAX_LINE_LEN) clen = MAX_LINE_LEN - 1;
+    memcpy(buf, clause, clen);
+    buf[clen] = '\0';
+    for (uint32_t i = mask_s; i < mask_s + mask_len && i < clen; i++) {
+        buf[i] = ' ';
+    }
+    grid_clear(out);
+    layers_encode_clause(buf, NULL, out);
+    update_rgb_directional(out);
+}
+
+/* ── main ─────────────────────────────────────────────── */
 
 int main(int argc, char* argv[]) {
     utf8_console_init();
@@ -187,9 +251,11 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr,
             "Usage: %s <text_file> [max_clauses]\n\n"
+            "  Train: 70%%, Test: 30%% (by clause order)\n"
+            "  Scoring: A x G_similarity x R_similarity  (SPEC §4, §9)\n\n"
             "Example:\n"
             "  %s data/sample_ko.txt\n"
-            "  %s data/sample_en.txt 500\n",
+            "  %s data/sample_en.txt 1000\n",
             argv[0], argv[0], argv[0]);
         return 1;
     }
@@ -203,19 +269,21 @@ int main(int argc, char* argv[]) {
 
     printf("========================================\n");
     printf("  SPATIAL-PATTERN-AI  Word Prediction\n");
+    printf("  (A x R_sim x G_sim x B_sim — SPEC §4 §5 §9)\n");
     printf("========================================\n");
-    printf("  File:        %s\n", filepath);
-    printf("  Max clauses: %u\n", max_clauses);
-    printf("  Test split:  %.0f%%\n", TEST_SPLIT * 100.0f);
+    printf("  File:         %s\n", filepath);
+    printf("  Max clauses:  %u\n", max_clauses);
+    printf("  Train ratio:  %.0f%%\n", TRAIN_RATIO * 100);
     printf("----------------------------------------\n\n");
 
     morpheme_init();
 
-    /* ── [1/4] Load ── */
-    printf("[1/4] Loading clauses...\n");
+    /* ── [1/5] Load ── */
+    printf("[1/5] Loading clauses...\n");
     double t0 = now_sec();
 
     char (*clauses)[MAX_LINE_LEN] = malloc((size_t)max_clauses * MAX_LINE_LEN);
+    if (!clauses) { fprintf(stderr, "alloc failed\n"); return 1; }
     uint32_t clause_count = 0;
     char line[MAX_LINE_LEN];
     char split_buf[8][MAX_LINE_LEN];
@@ -231,186 +299,217 @@ int main(int argc, char* argv[]) {
     fclose(fp);
     printf("  Loaded: %u clauses (%.2f sec)\n\n", clause_count, now_sec() - t0);
 
-    if (clause_count < 20) {
-        fprintf(stderr, "ERROR: need at least 20 clauses\n");
+    if (clause_count < 30) {
+        fprintf(stderr, "ERROR: need at least 30 clauses\n");
         free(clauses);
         return 1;
     }
 
-    uint32_t test_count  = (uint32_t)(clause_count * TEST_SPLIT);
-    if (test_count < 5) test_count = 5;
-    uint32_t train_count = clause_count - test_count;
+    uint32_t train_count = (uint32_t)(clause_count * TRAIN_RATIO);
+    uint32_t test_count  = clause_count - train_count;
 
-    /* ── [2/4] Train: word-layer distribution + vocabulary ── */
-    printf("[2/4] Training on %u clauses...\n", train_count);
+    /* ── [2/5] Train: store keyframes (RGB diffusion happens inside) ── */
+    printf("[2/5] Training on %u clauses...\n", train_count);
     t0 = now_sec();
 
-    /* word-layer frequency: count[y][x] over training */
-    double (*wcount)[256] = calloc(256 * 256, sizeof(double));
+    SpatialAI* ai = spatial_ai_create();
     VocabEntry* vocab = (VocabEntry*)calloc(MAX_VOCAB, sizeof(VocabEntry));
     uint32_t vcount = 0;
-
-    LayerBitmaps* lb = layers_create();
-    SpatialGrid* dummy = grid_create();
     WordSpan words[256];
 
     for (uint32_t c = 0; c < train_count; c++) {
-        /* Get word-layer bitmap */
-        memset(lb, 0, sizeof(LayerBitmaps));
-        layers_encode_clause(clauses[c], lb, dummy);
+        /* ai_store_auto internally runs layers_encode_clause + update_rgb_directional
+           → keyframes end up with *diffused* R/G/B channels */
+        ai_store_auto(ai, clauses[c], NULL);
 
-        for (uint32_t y = 0; y < 256; y++) {
-            for (uint32_t x = 0; x < 256; x++) {
-                wcount[y][x] += (double)lb->word[y * 256 + x];
-            }
-        }
-
-        /* Build vocab */
         uint32_t nw = extract_words(clauses[c], words, 256);
         for (uint32_t w = 0; w < nw; w++) {
             vocab_add(vocab, &vcount, MAX_VOCAB, words[w].text, words[w].len);
         }
-
-        if ((c + 1) % 200 == 0 || c + 1 == train_count) {
-            printf("\r  Processed: %u / %u (vocab=%u)", c + 1, train_count, vcount);
+        if ((c + 1) % 100 == 0 || c + 1 == train_count) {
+            printf("\r  Processed: %u / %u  (KF=%u Delta=%u vocab=%u)",
+                   c + 1, train_count, ai->kf_count, ai->df_count, vcount);
         }
     }
-    grid_destroy(dummy);
-    layers_destroy(lb);
-
-    /* Row totals */
-    double row_total[256];
-    for (uint32_t y = 0; y < 256; y++) {
-        double s = 0.0;
-        for (uint32_t x = 0; x < 256; x++) s += wcount[y][x];
-        row_total[y] = s;
-    }
-
     double t_train = now_sec() - t0;
-    printf("\n  Done in %.2f sec  (vocab size = %u)\n\n", t_train, vcount);
+    printf("\n  Done in %.2f sec\n\n", t_train);
 
-    /* ── [3/4] Predict masked words in test set ── */
-    printf("[3/4] Predicting masked words in %u held-out clauses...\n", test_count);
+    /* ── [3/5] Build aggregated RGBA tables ── */
+    printf("[3/5] Building aggregated A/R/G/B tables from %u keyframes...\n",
+           ai->kf_count);
     t0 = now_sec();
+    AggTables* agg = agg_build(ai);
+    if (!agg) { fprintf(stderr, "agg_build failed\n"); return 1; }
+
+    /* active cells in aggregated A */
+    uint32_t active_cells = 0;
+    for (uint32_t i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
+        if (agg->A_sum[i] > 0) active_cells++;
+    }
+    printf("  Active (y,v) cells:  %u / %u  (%.1f%%)\n",
+           active_cells, GRID_SIZE * GRID_SIZE,
+           100.0 * active_cells / (GRID_SIZE * GRID_SIZE));
+
+    /* per-length index for fast same-length candidate enumeration */
+    LengthBucket buckets[MAX_WORD_LEN];
+    memset(buckets, 0, sizeof(buckets));
+    lbuckets_build(buckets, vocab, vcount);
+    printf("  Vocab size:          %u\n", vcount);
+    printf("  Built in %.2f sec\n\n", now_sec() - t0);
+
+    /* ── [4/5] Predict masked words on test clauses ── */
+    printf("[4/5] Predicting every in-vocab word in %u held-out clauses...\n",
+           test_count);
+    t0 = now_sec();
+
+    SpatialGrid* masked_grid = grid_create();
+    InputSignature sig;
 
     uint32_t top1_hits = 0;
     uint32_t top5_hits = 0;
     uint32_t total_preds = 0;
-    double   log_p_sum = 0.0;
-    uint32_t oov = 0;   /* true word not in training vocab */
-
-    /* Score buffer: per-vocab log probability */
-    double* scores = (double*)malloc(MAX_VOCAB * sizeof(double));
-
     uint32_t clauses_with_any = 0;
+    uint32_t oov = 0;
+    uint32_t empty_candidates = 0;
+    double   log_p_sum = 0.0;
+
+    /* Per-length temporary score buffer */
+    double* tmp_scores = (double*)malloc(MAX_VOCAB * sizeof(double));
+
     for (uint32_t t = 0; t < test_count; t++) {
         uint32_t ci = train_count + t;
-
         uint32_t nw = extract_words(clauses[ci], words, 256);
-        if (nw < 2) continue;
+        if (nw < 1) continue;
 
         int any_in_clause = 0;
 
-        /* Predict every in-vocab word in the clause */
         for (uint32_t w = 0; w < nw; w++) {
             WordSpan* target = &words[w];
             int true_idx = vocab_find(vocab, vcount, target->text, target->len);
             if (true_idx < 0) { oov++; continue; }
 
-            /* Score every same-length candidate */
-            uint32_t candidates = 0;
-            double true_score = 0.0;
+            LengthBucket* b = &buckets[target->len];
+            if (b->count < 2) { continue; }  /* need candidates to rank */
 
-            for (uint32_t v = 0; v < vcount; v++) {
-                if (vocab[v].len != target->len) {
-                    scores[v] = -1e18;
-                    continue;
-                }
-                double lp = 0.0;
-                for (uint32_t i = 0; i < vocab[v].len; i++) {
-                    uint32_t y = (target->offset + i) % 256;
-                    uint8_t  v_byte = (uint8_t)vocab[v].word[i];
-                    double p = (wcount[y][v_byte] + EPSILON) /
-                               (row_total[y] + 256.0 * EPSILON);
-                    lp += log(p);
-                }
-                scores[v] = lp;
-                candidates++;
-                if ((int)v == true_idx) true_score = lp;
+            /* 1) Encode test clause with target word masked out.
+                  This gives the RGB context "without the target word". */
+            encode_masked(clauses[ci], target->offset, target->len, masked_grid);
+            input_signature_compute(&sig, masked_grid);
+
+            /* 2) Score every same-length vocab candidate */
+            double max_lp = -1e300;
+            double true_lp = 0.0;
+            for (uint32_t j = 0; j < b->count; j++) {
+                uint32_t vi = b->ids[j];
+                double lp = score_word(agg, &sig, target->offset,
+                                       vocab[vi].word, vocab[vi].len);
+                tmp_scores[j] = lp;
+                if (lp > max_lp) max_lp = lp;
+                if ((int)vi == true_idx) true_lp = lp;
             }
 
-            if (candidates < 2) continue;
+            /* Verify the true word had nonzero contribution.
+               If every byte of the true word scored zero (i.e., agg had no
+               evidence), flag as empty_candidates. */
+            if (!isfinite(true_lp) || true_lp < -1e200) {
+                empty_candidates++;
+                continue;
+            }
 
-            /* Rank position of true_idx */
+            /* 3) Rank: count candidates strictly better than true */
             uint32_t rank = 0;
-            for (uint32_t v = 0; v < vcount; v++) {
-                if ((int)v == true_idx) continue;
-                if (scores[v] > true_score) rank++;
+            for (uint32_t j = 0; j < b->count; j++) {
+                if (b->ids[j] == (uint32_t)true_idx) continue;
+                if (tmp_scores[j] > true_lp) rank++;
             }
+
+            /* 4) Softmax for perplexity (numerically stable) */
+            double denom = 0.0;
+            for (uint32_t j = 0; j < b->count; j++) {
+                denom += exp(tmp_scores[j] - max_lp);
+            }
+            double log_P_true = (true_lp - max_lp) - log(denom);
 
             if (rank == 0) top1_hits++;
             if (rank < 5)  top5_hits++;
-
-            log_p_sum += true_score;
+            log_p_sum += log_P_true;
             total_preds++;
             any_in_clause = 1;
         }
 
         if (any_in_clause) clauses_with_any++;
-
-        if ((t + 1) % 50 == 0 || t + 1 == test_count) {
-            printf("\r  Predicted: %u / %u clauses, %u preds", t + 1, test_count, total_preds);
+        if ((t + 1) % 20 == 0 || t + 1 == test_count) {
+            printf("\r  Progress: %u / %u clauses, %u preds",
+                   t + 1, test_count, total_preds);
         }
     }
+
+    free(tmp_scores);
+    grid_destroy(masked_grid);
 
     double t_pred = now_sec() - t0;
     printf("\n  Done in %.2f sec  (%.0f preds/sec)\n\n",
            t_pred, total_preds / (t_pred + 1e-9));
 
-    /* ── [4/4] Report ── */
-    printf("[4/4] Results\n");
+    /* ── [5/5] Report ── */
+    printf("[5/5] Results\n");
     printf("========================================\n\n");
 
-    printf("  VOCABULARY\n");
+    printf("  SETUP\n");
     printf("  ─────────────────────────────────────\n");
     printf("  Train clauses:         %u\n", train_count);
     printf("  Test clauses:          %u  (with predictions: %u)\n",
            test_count, clauses_with_any);
+    printf("  Keyframes (I):         %u\n", ai->kf_count);
+    printf("  Deltas (P):            %u\n", ai->df_count);
     printf("  Vocab size:            %u\n", vcount);
-    printf("  In-vocab predictions:  %u\n", total_preds);
-    printf("  OOV words skipped:     %u\n\n", oov);
+    printf("  In-vocab preds:        %u\n", total_preds);
+    printf("  OOV skipped:           %u\n", oov);
+    printf("  Empty-candidate:       %u\n\n", empty_candidates);
 
     if (total_preds > 0) {
         double top1 = 100.0 * top1_hits / total_preds;
         double top5 = 100.0 * top5_hits / total_preds;
-        double avg_lp = log_p_sum / total_preds;
-        double word_ppl = exp(-avg_lp);
+        double mean_log_P = log_p_sum / total_preds;
+        double perp = exp(-mean_log_P);
+
+        /* Random baseline = mean vocabulary size at the same length class */
+        double expected_candidates = 0;
+        uint32_t bucket_count = 0;
+        for (uint32_t L = 0; L < MAX_WORD_LEN; L++) {
+            if (buckets[L].count > 1) {
+                expected_candidates += (double)buckets[L].count;
+                bucket_count++;
+            }
+        }
+        double avg_cand = bucket_count ? expected_candidates / bucket_count : 1.0;
 
         printf("  ACCURACY\n");
         printf("  ─────────────────────────────────────\n");
-        printf("  Top-1:                %.2f%%  (%u / %u)\n",
+        printf("  Top-1:                 %.2f%%  (%u / %u)\n",
                top1, top1_hits, total_preds);
-        printf("  Top-5:                %.2f%%  (%u / %u)\n",
+        printf("  Top-5:                 %.2f%%  (%u / %u)\n",
                top5, top5_hits, total_preds);
-        printf("  Random baseline:      %.2f%%  (1 / vocab_same_len)\n\n",
-               100.0 / (double)vcount);
+        printf("  Random baseline:       %.2f%%  (avg same-length cands = %.0f)\n",
+               100.0 / avg_cand, avg_cand);
+        printf("  Lift over random:      %.1fx\n\n", top1 / (100.0 / avg_cand + 1e-9));
 
         printf("  WORD-LEVEL PERPLEXITY\n");
         printf("  ─────────────────────────────────────\n");
-        printf("  Avg NLL:              %.4f nats/word\n", -avg_lp);
-        printf("  Word perplexity:      %.2f\n", word_ppl);
-        printf("  (lower is better; uniform baseline = vocab_size)\n\n");
+        printf("  Avg -log P(true):      %.3f nats\n", -mean_log_P);
+        printf("  Perplexity:            %.2f\n\n", perp);
 
         printf("  INTERPRETATION\n");
         printf("  ─────────────────────────────────────\n");
-        if (top1 > 10.0)
-            printf("  Strong word-level prediction.\n");
-        else if (top1 > 2.0)
-            printf("  Measurable word-level signal.\n");
-        else if (top1 > 0.5)
-            printf("  Weak signal (increase training data).\n");
+        double lift = top1 * avg_cand / 100.0;
+        if (lift > 10)
+            printf("  Strong signal (>10x random baseline).\n");
+        else if (lift > 3)
+            printf("  Clear signal (>3x random baseline).\n");
+        else if (lift > 1.2)
+            printf("  Weak signal (>1.2x random).\n");
         else
-            printf("  Near baseline (train more clauses).\n");
+            printf("  Near baseline.\n");
         printf("\n");
     }
 
@@ -418,9 +517,10 @@ int main(int argc, char* argv[]) {
     printf("  PASS\n");
     printf("========================================\n");
 
-    free(scores);
+    lbuckets_free(buckets);
+    agg_destroy(agg);
     free(vocab);
-    free(wcount);
+    spatial_ai_destroy(ai);
     free(clauses);
     return 0;
 }

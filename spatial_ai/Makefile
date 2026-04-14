@@ -12,7 +12,8 @@ SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_layers.c \
        $(SRC_DIR)/spatial_match.c \
        $(SRC_DIR)/spatial_keyframe.c \
-       $(SRC_DIR)/spatial_context.c
+       $(SRC_DIR)/spatial_context.c \
+       $(SRC_DIR)/spatial_generate.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
