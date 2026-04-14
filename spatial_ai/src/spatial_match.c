@@ -400,6 +400,188 @@ uint32_t match_cascade(SpatialAI* ai, SpatialGrid* input,
 
 /* ── Public: match_cascade_topk ────────────────────────── */
 
+/* ── Adaptive channel weights ─────────────────────────── */
+
+void weight_init(ChannelWeight* w) {
+    if (!w) return;
+    w->w_A = 1.0f;
+    w->w_R = 1.0f;
+    w->w_G = 1.0f;
+    w->w_B = 1.0f;
+}
+
+void weight_normalize(ChannelWeight* w) {
+    if (!w) return;
+    float s = w->w_A + w->w_R + w->w_G + w->w_B;
+    if (s <= 0.0f) { weight_init(w); return; }
+    float k = 4.0f / s;
+    w->w_A *= k;
+    w->w_R *= k;
+    w->w_G *= k;
+    w->w_B *= k;
+    /* Guard small drift to keep weights non-negative in [0, 4] */
+    if (w->w_A < 0.0f) w->w_A = 0.0f;
+    if (w->w_R < 0.0f) w->w_R = 0.0f;
+    if (w->w_G < 0.0f) w->w_G = 0.0f;
+    if (w->w_B < 0.0f) w->w_B = 0.0f;
+}
+
+void weight_update(ChannelWeight* w,
+                   float sim_A, float sim_R, float sim_G, float sim_B) {
+    if (!w) return;
+
+    /* Winner takes the reward, others get a small decay. */
+    float best = sim_A; int idx = 0;
+    if (sim_R > best) { best = sim_R; idx = 1; }
+    if (sim_G > best) { best = sim_G; idx = 2; }
+    if (sim_B > best) { best = sim_B; idx = 3; }
+
+    const float lr       = WEIGHT_LEARNING_RATE;
+    const float decay    = lr / 3.0f;
+
+    /* Apply to all four, subtract LR/3 from losers */
+    w->w_A -= decay;
+    w->w_R -= decay;
+    w->w_G -= decay;
+    w->w_B -= decay;
+
+    /* Add LR to winner (so net effect for winner = +LR + decay extra = +LR - decay?
+       simpler: undo subtract for winner and add LR directly.) */
+    switch (idx) {
+        case 0: w->w_A += (lr + decay); break;
+        case 1: w->w_R += (lr + decay); break;
+        case 2: w->w_G += (lr + decay); break;
+        case 3: w->w_B += (lr + decay); break;
+    }
+    weight_normalize(w);
+}
+
+/* ── Per-channel similarity helpers ───────────────────── */
+
+/* Average (1 - |Δ|/255) over cells where both A's are > 0.
+ * Returns 0 if no co-active cells. */
+static float avg_rgb_sim(const uint8_t* a_ch, const uint8_t* b_ch,
+                          const uint16_t* a_A, const uint16_t* b_A) {
+    double sum = 0.0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (a_A[i] == 0 || b_A[i] == 0) continue;
+        sum += 1.0 - fabs((double)a_ch[i] - b_ch[i]) / 255.0;
+        n++;
+    }
+    if (n == 0) return 0.0f;
+    return (float)(sum / n);
+}
+
+float channel_sim_A(const SpatialGrid* a, const SpatialGrid* b) {
+    if (!a || !b) return 0.0f;
+    return cosine_a_only(a, b);
+}
+
+float channel_sim_R(const SpatialGrid* a, const SpatialGrid* b) {
+    if (!a || !b) return 0.0f;
+    return avg_rgb_sim(a->R, b->R, a->A, b->A);
+}
+
+float channel_sim_G(const SpatialGrid* a, const SpatialGrid* b) {
+    if (!a || !b) return 0.0f;
+    return avg_rgb_sim(a->G, b->G, a->A, b->A);
+}
+
+float channel_sim_B(const SpatialGrid* a, const SpatialGrid* b) {
+    if (!a || !b) return 0.0f;
+    return avg_rgb_sim(a->B, b->B, a->A, b->A);
+}
+
+float adaptive_score(const SpatialGrid* a, const SpatialGrid* b,
+                     const ChannelWeight* w) {
+    if (!a || !b) return 0.0f;
+    ChannelWeight def;
+    weight_init(&def);
+    if (!w) w = &def;
+
+    float sA = channel_sim_A(a, b);
+    float sR = channel_sim_R(a, b);
+    float sG = channel_sim_G(a, b);
+    float sB = channel_sim_B(a, b);
+
+    return (w->w_A * sA + w->w_R * sR + w->w_G * sG + w->w_B * sB) / 4.0f;
+}
+
+/* ── Weighted cascade variants ────────────────────────── */
+
+uint32_t match_cascade_weighted(SpatialAI* ai, SpatialGrid* input,
+                                CascadeMode mode, const ChannelWeight* w,
+                                float* out_similarity) {
+    if (!w) return match_cascade(ai, input, mode, out_similarity);
+    if (!ai || !input || ai->kf_count == 0) {
+        if (out_similarity) *out_similarity = 0.0f;
+        return 0;
+    }
+
+    /* Step 1: A-only cascade step, same as match_cascade */
+    float a_sim = 0.0f;
+    uint32_t a_best = cascade_step1_best(ai, input, &a_sim);
+
+    if (mode == CASCADE_SEARCH) {
+        if (out_similarity) *out_similarity = a_sim;
+        return a_best;
+    }
+    if (a_sim >= CASCADE_STEP1_THRESHOLD) {
+        if (out_similarity) *out_similarity = a_sim;
+        return a_best;
+    }
+
+    /* Step 2/3: use adaptive_score directly. The weighted score
+       combines all four channels; cascade mode affects which
+       candidates we re-rank but scoring is uniform. */
+    uint32_t n = ai->kf_count;
+    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
+    if (!pool) {
+        if (out_similarity) *out_similarity = a_sim;
+        return a_best;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        pool[i].id = i;
+        pool[i].score = adaptive_score(input, &ai->keyframes[i].grid, w);
+    }
+    uint32_t k = (TOP_K < n) ? TOP_K : n;
+    topk_select(pool, n, k);
+
+    uint32_t final_id = pool[0].id;
+    float final_score = pool[0].score;
+    free(pool);
+
+    if (out_similarity) *out_similarity = final_score;
+    return final_id;
+}
+
+uint32_t match_cascade_topk_weighted(SpatialAI* ai, SpatialGrid* input,
+                                     CascadeMode mode, const ChannelWeight* w,
+                                     uint32_t k, uint32_t* out_ids,
+                                     float* out_scores) {
+    if (!w) return match_cascade_topk(ai, input, mode, k, out_ids, out_scores);
+    if (!ai || !input || !out_ids || !out_scores || ai->kf_count == 0 || k == 0) return 0;
+
+    (void)mode;  /* adaptive top-K ignores mode — it re-ranks by adaptive_score */
+
+    uint32_t n = ai->kf_count;
+    if (k > n) k = n;
+    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
+    if (!pool) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        pool[i].id = i;
+        pool[i].score = adaptive_score(input, &ai->keyframes[i].grid, w);
+    }
+    topk_select(pool, n, k);
+    for (uint32_t i = 0; i < k; i++) {
+        out_ids[i]    = pool[i].id;
+        out_scores[i] = pool[i].score;
+    }
+    free(pool);
+    return k;
+}
+
 uint32_t match_cascade_topk(SpatialAI* ai, SpatialGrid* input,
                             CascadeMode mode, uint32_t k,
                             uint32_t* out_ids, float* out_scores) {

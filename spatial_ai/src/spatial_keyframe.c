@@ -18,6 +18,9 @@ SpatialAI* spatial_ai_create(void) {
     ai->df_capacity = INITIAL_CAPACITY;
     ai->deltas = (DeltaFrame*)calloc(INITIAL_CAPACITY, sizeof(DeltaFrame));
 
+    /* Adaptive channel weights start uniform */
+    weight_init(&ai->global_weights);
+
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
         return NULL;
@@ -206,6 +209,18 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         df->entries = shrunk ? shrunk : entries;
         df->change_ratio = (float)delta_count / (float)grid_active_count(input);
 
+        /* Adaptive feedback: good structural match → boost the channel
+         * that most contributed. Compute per-channel similarities
+         * between input and matched parent keyframe. */
+        {
+            SpatialGrid* parent = &ai->keyframes[best_id].grid;
+            float sA = channel_sim_A(input, parent);
+            float sR = channel_sim_R(input, parent);
+            float sG = channel_sim_G(input, parent);
+            float sB = channel_sim_B(input, parent);
+            weight_update(&ai->global_weights, sA, sR, sG, sB);
+        }
+
         ai->df_count++;
         grid_destroy(input);
         return df->id | 0x80000000u; /* high bit indicates delta */
@@ -220,6 +235,20 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
         keyframe_alloc_grid(kf, input);
+
+        /* Adaptive feedback for "novel" input: compare against the
+         * nearest existing keyframe to learn which channel saw it as
+         * novel (i.e. produced low similarity). Channels that were
+         * already low-similarity have done their job in distinguishing
+         * the new pattern; they earn a small boost. */
+        if (best_id < ai->kf_count - 1) {  /* -1 since we just added */
+            SpatialGrid* nearest = &ai->keyframes[best_id].grid;
+            float sA = 1.0f - channel_sim_A(input, nearest);
+            float sR = 1.0f - channel_sim_R(input, nearest);
+            float sG = 1.0f - channel_sim_G(input, nearest);
+            float sB = 1.0f - channel_sim_B(input, nearest);
+            weight_update(&ai->global_weights, sA, sR, sG, sB);
+        }
 
         ai->kf_count++;
         grid_destroy(input);

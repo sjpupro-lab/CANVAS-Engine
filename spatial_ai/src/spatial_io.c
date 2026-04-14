@@ -34,7 +34,9 @@ const char* spai_status_str(SpaiStatus s) {
 static SpaiStatus read_header(FILE* fp, SpaiHeader* h) {
     if (fread(h, sizeof(*h), 1, fp) != 1) return SPAI_ERR_READ;
     if (memcmp(h->magic, SPAI_MAGIC, 4) != 0) return SPAI_ERR_MAGIC;
-    if (h->version != SPAI_VERSION) return SPAI_ERR_VERSION;
+    /* Accept any version ≤ current; older files just omit sections
+     * added in later versions. */
+    if (h->version == 0 || h->version > SPAI_VERSION) return SPAI_ERR_VERSION;
     return SPAI_OK;
 }
 
@@ -159,6 +161,24 @@ static int grow_df_cap(SpatialAI* ai, uint32_t needed) {
 
 /* ── Public: save ── */
 
+static SpaiStatus write_weights_record(FILE* fp, const ChannelWeight* w) {
+    uint8_t tag = SPAI_TAG_WEIGHTS;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&w->w_A, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&w->w_R, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&w->w_G, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&w->w_B, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
+    return SPAI_OK;
+}
+
+static SpaiStatus read_weights_body(FILE* fp, ChannelWeight* w) {
+    if (fread(&w->w_A, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&w->w_R, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&w->w_G, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&w->w_B, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
+    return SPAI_OK;
+}
+
 SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     if (!ai || !path) return SPAI_ERR_OPEN;
 
@@ -178,6 +198,10 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
         s = write_delta_record(fp, &ai->deltas[i]);
         if (s != SPAI_OK) { fclose(fp); return s; }
     }
+
+    /* v2: adaptive channel weights as trailing record */
+    s = write_weights_record(fp, &ai->global_weights);
+    if (s != SPAI_OK) { fclose(fp); return s; }
 
     if (fclose(fp) != 0) return SPAI_ERR_WRITE;
     return SPAI_OK;
@@ -205,7 +229,8 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
         return NULL;
     }
 
-    /* Walk records until EOF or until expected counts reached. */
+    /* Walk records. Read until both KF and Delta counts are satisfied,
+     * then check for optional v2+ trailing records (weights). */
     uint32_t kfs_read = 0, dfs_read = 0;
     while (kfs_read < h.kf_count || dfs_read < h.df_count) {
         uint8_t tag;
@@ -243,7 +268,6 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
             }
             dfs_read++;
         } else {
-            /* Unknown tag — treat as corruption */
             fclose(fp); spatial_ai_destroy(ai);
             if (out_status) *out_status = SPAI_ERR_CORRUPT;
             return NULL;
@@ -252,6 +276,27 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
 
     ai->kf_count = kfs_read;
     ai->df_count = dfs_read;
+
+    /* Optional trailing records (v2+): weights */
+    uint8_t tag;
+    while (fread(&tag, 1, 1, fp) == 1) {
+        if (tag == SPAI_TAG_WEIGHTS) {
+            s = read_weights_body(fp, &ai->global_weights);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
+            /* weight_normalize defensively in case the on-disk values
+             * drifted from the sum = 4 invariant. */
+            weight_normalize(&ai->global_weights);
+        } else {
+            /* Unknown trailing tag — stop cleanly, forward compatible. */
+            break;
+        }
+    }
+    /* If file had no weights block (v1 file), global_weights stays at
+     * the default set by spatial_ai_create. */
 
     fclose(fp);
     if (out_status) *out_status = SPAI_OK;
@@ -288,30 +333,13 @@ SpaiStatus ai_save_incremental(const SpatialAI* ai, const char* path) {
         return SPAI_OK;
     }
 
-    /* 4) Open for update, append new records at end, rewrite header. */
-    fp = fopen(path, "r+b");
-    if (!fp) return SPAI_ERR_OPEN;
-
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return SPAI_ERR_WRITE; }
-
-    /* New keyframes */
-    for (uint32_t i = h.kf_count; i < ai->kf_count; i++) {
-        SpaiStatus ws = write_keyframe_record(fp, &ai->keyframes[i]);
-        if (ws != SPAI_OK) { fclose(fp); return ws; }
-    }
-    /* New deltas */
-    for (uint32_t i = h.df_count; i < ai->df_count; i++) {
-        SpaiStatus ws = write_delta_record(fp, &ai->deltas[i]);
-        if (ws != SPAI_OK) { fclose(fp); return ws; }
-    }
-
-    /* Rewrite header with updated totals. */
-    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return SPAI_ERR_WRITE; }
-    SpaiStatus hs = write_header(fp, ai->kf_count, ai->df_count);
-    if (hs != SPAI_OK) { fclose(fp); return hs; }
-
-    if (fclose(fp) != 0) return SPAI_ERR_WRITE;
-    return SPAI_OK;
+    /* 4) Full rewrite: incremental save cannot trivially update a
+     *    trailing weights block in place (it sits after records).
+     *    For simplicity and correctness we rewrite the whole file;
+     *    callers with huge KF counts can still call ai_save_incremental
+     *    — it's equivalent to ai_save when weights are present. */
+    (void)h;  /* unused now */
+    return ai_save(ai, path);
 }
 
 /* ── Public: peek header ── */

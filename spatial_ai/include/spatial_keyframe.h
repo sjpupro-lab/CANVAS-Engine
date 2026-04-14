@@ -47,6 +47,11 @@ typedef struct SpatialAI_ {
     DeltaFrame*   deltas;
     uint32_t      df_count;
     uint32_t      df_capacity;
+
+    /* Adaptive channel weights (SPEC §5: dynamic RGB embedding).
+     * Initialised to (1, 1, 1, 1) by spatial_ai_create; updated
+     * automatically after each ai_store_auto by the engine. */
+    ChannelWeight global_weights;
 } SpatialAI;
 
 /* Create/destroy engine */

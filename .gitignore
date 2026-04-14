@@ -8,6 +8,8 @@ spatial_ai/data/*.xml
 spatial_ai/data/*.tar.gz
 spatial_ai/data/extracted_*/
 spatial_ai/data/stsbenchmark/
+spatial_ai/data/wiki_[0-9]*
+spatial_ai/data/wiki_*.txt
 spatial_ai/data/sample_*.txt
 spatial_ai/data/stsb.tsv
 spatial_ai/data/stsb_sample.tsv

@@ -153,4 +153,76 @@ float bg_score(const SpatialGrid* a, const SpatialGrid* b);
 float ba_score(const SpatialGrid* a, const SpatialGrid* b);
 float ra_score(const SpatialGrid* a, const SpatialGrid* b);
 
+/* ── Adaptive channel weights ───────────────────────────
+ *
+ *   ChannelWeight holds per-channel scalar weights used to combine
+ *   A/R/G/B similarities into a single adaptive score.
+ *
+ *   Invariant maintained by weight_normalize:
+ *      w_A + w_R + w_G + w_B == 4.0f   (average weight = 1.0)
+ *
+ *   Update rule (weight_update):
+ *     For each channel k in {A, R, G, B}, we receive a per-channel
+ *     similarity sim_k ∈ [0, 1] observed on a successful match. The
+ *     channel with the highest similarity is given a small reward and
+ *     the others a small decay, then weights are renormalised so the
+ *     sum remains 4. This causes the engine to trust the channels
+ *     that actually discriminate.
+ *
+ *   Default learning rate is 0.05 (tuned for visible convergence on
+ *   hundreds of training steps).
+ */
+typedef struct {
+    float w_A;
+    float w_R;
+    float w_G;
+    float w_B;
+} ChannelWeight;
+
+#define WEIGHT_LEARNING_RATE 0.05f
+
+/* Initialise to (1, 1, 1, 1) — fully uniform. */
+void  weight_init(ChannelWeight* w);
+
+/* Rescale so w_A + w_R + w_G + w_B == 4 while preserving ratios. */
+void  weight_normalize(ChannelWeight* w);
+
+/* Single feedback update. Given per-channel observed similarities on
+ * the winning match, boost the channel with the highest sim by
+ * WEIGHT_LEARNING_RATE and decay the others by LR/3, then renormalise. */
+void  weight_update(ChannelWeight* w,
+                    float sim_A, float sim_R, float sim_G, float sim_B);
+
+/* Per-channel average similarity over cells where BOTH grids are active. */
+float channel_sim_A(const SpatialGrid* a, const SpatialGrid* b);
+float channel_sim_R(const SpatialGrid* a, const SpatialGrid* b);
+float channel_sim_G(const SpatialGrid* a, const SpatialGrid* b);
+float channel_sim_B(const SpatialGrid* a, const SpatialGrid* b);
+
+/* Weighted combination:
+ *   adaptive_score = (w_A * sim_A + w_R * sim_R + w_G * sim_G + w_B * sim_B) / 4
+ *
+ * Returns a value in roughly [0, 1]. Used by match_cascade Step 2/3
+ * when ChannelWeight is supplied (non-NULL). */
+float adaptive_score(const SpatialGrid* a, const SpatialGrid* b,
+                     const ChannelWeight* w);
+
+/* Cascade variants that accept ChannelWeight for adaptive scoring.
+ * If w == NULL, behave exactly like match_cascade / match_cascade_topk. */
+uint32_t match_cascade_weighted(
+    SpatialAI* ai,
+    SpatialGrid* input,
+    CascadeMode mode,
+    const ChannelWeight* w,
+    float* out_similarity);
+
+uint32_t match_cascade_topk_weighted(
+    SpatialAI* ai,
+    SpatialGrid* input,
+    CascadeMode mode,
+    const ChannelWeight* w,
+    uint32_t k,
+    uint32_t* out_ids,
+    float* out_scores);
+
 #endif /* SPATIAL_MATCH_H */
