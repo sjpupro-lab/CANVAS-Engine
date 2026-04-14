@@ -42,7 +42,9 @@
 #include "spatial_match.h"
 #include "spatial_keyframe.h"
 #include "spatial_generate.h"
+#include "spatial_io.h"
 #include "bench_utf8.h"
+#include "bench_args.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -248,20 +250,22 @@ static void encode_masked(const char* clause, uint32_t mask_s, uint32_t mask_len
 int main(int argc, char* argv[]) {
     utf8_console_init();
 
-    if (argc < 2) {
+    BenchArgs ba;
+    if (bench_parse_args(argc, argv, &ba) != 0 || ba.positional_count < 1) {
         fprintf(stderr,
-            "Usage: %s <text_file> [max_clauses]\n\n"
+            "Usage: %s <text_file> [max_clauses] [--save P] [--load P] [--load-only P]\n\n"
             "  Train: 70%%, Test: 30%% (by clause order)\n"
-            "  Scoring: A x G_similarity x R_similarity  (SPEC §4, §9)\n\n"
+            "  Scoring: A x R_sim x G_sim x B_sim  (SPEC §4 §5 §9)\n\n"
             "Example:\n"
-            "  %s data/sample_ko.txt\n"
-            "  %s data/sample_en.txt 1000\n",
+            "  %s data/sample_ko.txt --save model_ko.spai\n"
+            "  %s data/sample_en.txt 1000 --load-only model_ko.spai\n",
             argv[0], argv[0], argv[0]);
         return 1;
     }
 
-    const char* filepath = argv[1];
-    uint32_t max_clauses = (argc >= 3) ? (uint32_t)atoi(argv[2]) : DEFAULT_LIMIT;
+    const char* filepath   = ba.positional[0];
+    uint32_t    max_clauses = (ba.positional_count >= 2) ?
+                              (uint32_t)atoi(ba.positional[1]) : DEFAULT_LIMIT;
     if (max_clauses > MAX_CLAUSES) max_clauses = MAX_CLAUSES;
 
     FILE* fp = fopen(filepath, "r");
@@ -312,27 +316,72 @@ int main(int argc, char* argv[]) {
     printf("[2/5] Training on %u clauses...\n", train_count);
     t0 = now_sec();
 
-    SpatialAI* ai = spatial_ai_create();
+    SpatialAI* ai = NULL;
+    uint32_t loaded_kf = 0, loaded_df = 0;
+    if (ba.load_path) {
+        SpaiStatus ls;
+        ai = ai_load(ba.load_path, &ls);
+        if (!ai) {
+            fprintf(stderr, "  ERROR: load '%s' failed: %s\n",
+                    ba.load_path, spai_status_str(ls));
+            free(clauses);
+            return 1;
+        }
+        loaded_kf = ai->kf_count;
+        loaded_df = ai->df_count;
+        printf("  Loaded '%s': %u KF, %u Delta\n", ba.load_path, loaded_kf, loaded_df);
+    } else {
+        ai = spatial_ai_create();
+    }
+
     VocabEntry* vocab = (VocabEntry*)calloc(MAX_VOCAB, sizeof(VocabEntry));
     uint32_t vcount = 0;
     WordSpan words[256];
 
-    for (uint32_t c = 0; c < train_count; c++) {
-        /* ai_store_auto internally runs layers_encode_clause + update_rgb_directional
-           → keyframes end up with *diffused* R/G/B channels */
-        ai_store_auto(ai, clauses[c], NULL);
+    if (!ba.load_only) {
+        for (uint32_t c = 0; c < train_count; c++) {
+            /* ai_store_auto internally runs layers_encode_clause + update_rgb_directional
+               → keyframes end up with *diffused* R/G/B channels */
+            ai_store_auto(ai, clauses[c], NULL);
 
-        uint32_t nw = extract_words(clauses[c], words, 256);
-        for (uint32_t w = 0; w < nw; w++) {
-            vocab_add(vocab, &vcount, MAX_VOCAB, words[w].text, words[w].len);
+            uint32_t nw = extract_words(clauses[c], words, 256);
+            for (uint32_t w = 0; w < nw; w++) {
+                vocab_add(vocab, &vcount, MAX_VOCAB, words[w].text, words[w].len);
+            }
+            if ((c + 1) % 100 == 0 || c + 1 == train_count) {
+                printf("\r  Processed: %u / %u  (KF=%u Delta=%u vocab=%u)",
+                       c + 1, train_count, ai->kf_count, ai->df_count, vcount);
+            }
         }
-        if ((c + 1) % 100 == 0 || c + 1 == train_count) {
-            printf("\r  Processed: %u / %u  (KF=%u Delta=%u vocab=%u)",
-                   c + 1, train_count, ai->kf_count, ai->df_count, vcount);
+    } else {
+        /* load-only: still need vocab for scoring → scan train split for words */
+        printf("  --load-only: skipping training. Building vocab from text...\n");
+        for (uint32_t c = 0; c < train_count; c++) {
+            uint32_t nw = extract_words(clauses[c], words, 256);
+            for (uint32_t w = 0; w < nw; w++) {
+                vocab_add(vocab, &vcount, MAX_VOCAB, words[w].text, words[w].len);
+            }
         }
     }
     double t_train = now_sec() - t0;
-    printf("\n  Done in %.2f sec\n\n", t_train);
+    printf("\n  Done in %.2f sec\n", t_train);
+
+    /* Save if requested */
+    if (ba.save_path) {
+        SpaiStatus ss;
+        if (ba.load_path && strcmp(ba.load_path, ba.save_path) == 0) {
+            ss = ai_save_incremental(ai, ba.save_path);
+            printf("  [save] incremental → '%s' : %s  (KF %u→%u, Delta %u→%u)\n",
+                   ba.save_path, spai_status_str(ss),
+                   loaded_kf, ai->kf_count, loaded_df, ai->df_count);
+        } else {
+            ss = ai_save(ai, ba.save_path);
+            printf("  [save] full → '%s' : %s  (%u KF, %u Delta)\n",
+                   ba.save_path, spai_status_str(ss),
+                   ai->kf_count, ai->df_count);
+        }
+    }
+    printf("\n");
 
     /* ── [3/5] Build aggregated RGBA tables ── */
     printf("[3/5] Building aggregated A/R/G/B tables from %u keyframes...\n",

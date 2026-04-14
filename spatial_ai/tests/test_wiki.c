@@ -22,7 +22,9 @@
 #include "spatial_match.h"
 #include "spatial_keyframe.h"
 #include "spatial_context.h"
+#include "spatial_io.h"
 #include "bench_utf8.h"
+#include "bench_args.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,22 +134,27 @@ static void make_prefix(const char* src, char* dst, uint32_t max_bytes) {
 int main(int argc, char* argv[]) {
     utf8_console_init();
 
-    if (argc < 2) {
+    BenchArgs ba;
+    if (bench_parse_args(argc, argv, &ba) != 0 || ba.positional_count < 1) {
         fprintf(stderr,
-            "Usage: %s <text_file> [max_clauses]\n"
+            "Usage: %s <text_file> [max_clauses] [--save PATH] [--load PATH] [--load-only PATH]\n"
             "\n"
-            "  text_file    Plain text (wikiextractor output)\n"
-            "  max_clauses  Optional limit (default: %d)\n"
+            "  text_file     Plain text (wikiextractor output)\n"
+            "  max_clauses   Optional limit (default: %d)\n"
+            "  --save  P     Save model after training\n"
+            "  --load  P     Load existing model, continue training\n"
+            "  --load-only P Load existing model, skip training\n"
             "\n"
             "Example:\n"
-            "  %s data/sample_ko.txt\n"
-            "  %s data/sample_en.txt 500\n",
+            "  %s data/sample_ko.txt --save model_ko.spai\n"
+            "  %s data/sample_en.txt --load model_ko.spai --save mixed.spai\n",
             argv[0], DEFAULT_LIMIT, argv[0], argv[0]);
         return 1;
     }
 
-    const char* filepath = argv[1];
-    uint32_t max_clauses = (argc >= 3) ? (uint32_t)atoi(argv[2]) : DEFAULT_LIMIT;
+    const char* filepath   = ba.positional[0];
+    uint32_t    max_clauses = (ba.positional_count >= 2) ?
+                              (uint32_t)atoi(ba.positional[1]) : DEFAULT_LIMIT;
     if (max_clauses > MAX_CLAUSES) max_clauses = MAX_CLAUSES;
 
     FILE* fp = fopen(filepath, "r");
@@ -228,17 +235,50 @@ int main(int argc, char* argv[]) {
     printf("[2/7] Encoding + storing (3-layer → RGB → auto I/P)...\n");
     t0 = now_sec();
 
-    SpatialAI* ai = spatial_ai_create();
+    SpatialAI* ai = NULL;
+    uint32_t loaded_kf = 0, loaded_df = 0;
+
+    if (ba.load_path) {
+        SpaiStatus ls;
+        ai = ai_load(ba.load_path, &ls);
+        if (!ai) {
+            fprintf(stderr, "\n  ERROR: load '%s' failed: %s\n",
+                    ba.load_path, spai_status_str(ls));
+            free(clauses); free(script);
+            return 1;
+        }
+        loaded_kf = ai->kf_count;
+        loaded_df = ai->df_count;
+        printf("  Loaded '%s': %u keyframes, %u deltas\n",
+               ba.load_path, loaded_kf, loaded_df);
+    } else {
+        ai = spatial_ai_create();
+    }
+
     FrameCache cache;
     cache_init(&cache);
     BucketIndex bidx;
     bucket_index_init(&bidx);
+
+    /* Re-populate bucket index for all loaded keyframes */
+    for (uint32_t i = 0; i < loaded_kf; i++) {
+        bucket_index_add(&bidx, &ai->keyframes[i].grid, i);
+    }
 
     /* Store map: clause idx → keyframe idx (or 0xFFFFFFFF if delta) */
     uint32_t* clause_to_kf = (uint32_t*)malloc(clause_count * sizeof(uint32_t));
 
     uint64_t total_blocks_checked = 0;
     uint64_t total_blocks_skipped = 0;
+
+    if (ba.load_only) {
+        /* No training — just mark all clauses as "not stored" so the rest
+           of the pipeline still runs queries against loaded keyframes. */
+        for (uint32_t i = 0; i < clause_count; i++) clause_to_kf[i] = 0xFFFFFFFFu;
+        printf("  --load-only: skipping training, %u keyframes available for query.\n",
+               ai->kf_count);
+        goto training_done;
+    }
 
     for (uint32_t i = 0; i < clause_count; i++) {
         uint32_t fid = ai_store_auto(ai, clauses[i], "wiki");
@@ -267,6 +307,28 @@ int main(int argc, char* argv[]) {
     double t_store = now_sec() - t0;
     printf("\n  Done in %.2f sec  (%.0f clauses/sec)\n\n",
            t_store, clause_count / t_store);
+
+training_done:
+
+    /* Save model if requested. Prefer incremental if we loaded. */
+    if (ba.save_path) {
+        SpaiStatus ss;
+        if (ba.load_path && strcmp(ba.load_path, ba.save_path) == 0) {
+            ss = ai_save_incremental(ai, ba.save_path);
+            printf("  [save] incremental → '%s' : %s  (KF %u→%u, Delta %u→%u)\n",
+                   ba.save_path, spai_status_str(ss),
+                   loaded_kf, ai->kf_count, loaded_df, ai->df_count);
+        } else {
+            ss = ai_save(ai, ba.save_path);
+            printf("  [save] full → '%s' : %s  (%u KF, %u Delta)\n",
+                   ba.save_path, spai_status_str(ss),
+                   ai->kf_count, ai->df_count);
+        }
+        if (ss != SPAI_OK) {
+            fprintf(stderr, "  WARNING: save failed\n");
+        }
+        printf("\n");
+    }
 
     /* ── [3/7] Match queries ── */
     printf("[3/7] Running match queries (overlap → cosine)...\n");

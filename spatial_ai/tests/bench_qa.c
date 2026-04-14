@@ -39,7 +39,9 @@
 #include "spatial_keyframe.h"
 #include "spatial_context.h"
 #include "spatial_generate.h"
+#include "spatial_io.h"
 #include "bench_utf8.h"
+#include "bench_args.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,20 +90,21 @@ static int parse_line(const char* line, QAPair* out) {
 int main(int argc, char* argv[]) {
     utf8_console_init();
 
-    if (argc < 2) {
+    BenchArgs ba;
+    if (bench_parse_args(argc, argv, &ba) != 0 || ba.positional_count < 1) {
         fprintf(stderr,
-            "Usage: %s <qa.tsv> [max_pairs]\n\n"
+            "Usage: %s <qa.tsv> [max_pairs] [--save P] [--load P] [--load-only P]\n\n"
             "  TSV format:  <question>\\t<answer>   (one pair per line)\n"
             "  Train: 70%%, Test: 30%% (by pair order)\n"
             "  Neighbor radius: %d frames\n\n"
             "Example:\n"
-            "  %s data/qa.tsv\n",
+            "  %s data/qa.tsv --save model_qa.spai\n",
             argv[0], NEIGHBOR_RADIUS, argv[0]);
         return 1;
     }
 
-    const char* filepath = argv[1];
-    int max_pairs = (argc >= 3) ? atoi(argv[2]) : DEFAULT_LIMIT;
+    const char* filepath = ba.positional[0];
+    int max_pairs = (ba.positional_count >= 2) ? atoi(ba.positional[1]) : DEFAULT_LIMIT;
     if (max_pairs > MAX_PAIRS) max_pairs = MAX_PAIRS;
 
     FILE* fp = fopen(filepath, "r");
@@ -146,16 +149,42 @@ int main(int argc, char* argv[]) {
     printf("[2/4] Storing %d training pairs as consecutive keyframes...\n", train_n);
     t0 = now_sec();
 
-    SpatialAI* ai = spatial_ai_create();
+    SpatialAI* ai = NULL;
+    uint32_t loaded_kf = 0, loaded_df = 0;
+    if (ba.load_path) {
+        SpaiStatus ls;
+        ai = ai_load(ba.load_path, &ls);
+        if (!ai) {
+            fprintf(stderr, "  ERROR: load '%s' failed: %s\n",
+                    ba.load_path, spai_status_str(ls));
+            for (int i = 0; i < n; i++) { free(pairs[i].q); free(pairs[i].a); }
+            free(pairs);
+            return 1;
+        }
+        loaded_kf = ai->kf_count;
+        loaded_df = ai->df_count;
+        printf("  Loaded '%s': %u KF, %u Delta\n", ba.load_path, loaded_kf, loaded_df);
+    } else {
+        ai = spatial_ai_create();
+    }
+
     FrameCache cache;
     cache_init(&cache);
     BucketIndex bidx;
     bucket_index_init(&bidx);
+    for (uint32_t k = 0; k < loaded_kf; k++) {
+        bucket_index_add(&bidx, &ai->keyframes[k].grid, k);
+    }
 
     /* Track which keyframe id holds each pair's Q and A. */
     uint32_t* q_kf = (uint32_t*)malloc((size_t)train_n * sizeof(uint32_t));
     uint32_t* a_kf = (uint32_t*)malloc((size_t)train_n * sizeof(uint32_t));
     for (int i = 0; i < train_n; i++) { q_kf[i] = UINT32_MAX; a_kf[i] = UINT32_MAX; }
+
+    if (ba.load_only) {
+        printf("  --load-only: skipping QA training\n");
+        goto qa_training_done;
+    }
 
     for (int i = 0; i < train_n; i++) {
         char qlabel[16], alabel[16];
@@ -188,7 +217,25 @@ int main(int argc, char* argv[]) {
     }
 
     double t_store = now_sec() - t0;
-    printf("\n  Done in %.2f sec\n\n", t_store);
+    printf("\n  Done in %.2f sec\n", t_store);
+
+qa_training_done:
+    /* Save model if requested */
+    if (ba.save_path) {
+        SpaiStatus ss;
+        if (ba.load_path && strcmp(ba.load_path, ba.save_path) == 0) {
+            ss = ai_save_incremental(ai, ba.save_path);
+            printf("  [save] incremental → '%s' : %s  (KF %u→%u, Delta %u→%u)\n",
+                   ba.save_path, spai_status_str(ss),
+                   loaded_kf, ai->kf_count, loaded_df, ai->df_count);
+        } else {
+            ss = ai_save(ai, ba.save_path);
+            printf("  [save] full → '%s' : %s  (%u KF, %u Delta)\n",
+                   ba.save_path, spai_status_str(ss),
+                   ai->kf_count, ai->df_count);
+        }
+    }
+    printf("\n");
 
     /* ── [3/4] Evaluate on held-out pairs ── */
     printf("[3/4] Evaluating on %d held-out pairs...\n", test_n);
