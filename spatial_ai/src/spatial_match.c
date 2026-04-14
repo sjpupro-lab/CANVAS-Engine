@@ -8,6 +8,15 @@
 void update_rgb_directional(SpatialGrid* grid) {
     if (!grid) return;
 
+    uint8_t oldR[GRID_TOTAL], oldG[GRID_TOTAL], oldB[GRID_TOTAL];
+    uint8_t newR[GRID_TOTAL], newG[GRID_TOTAL], newB[GRID_TOTAL];
+    memcpy(oldR, grid->R, GRID_TOTAL);
+    memcpy(oldG, grid->G, GRID_TOTAL);
+    memcpy(oldB, grid->B, GRID_TOTAL);
+    memcpy(newR, grid->R, GRID_TOTAL);
+    memcpy(newG, grid->G, GRID_TOTAL);
+    memcpy(newB, grid->B, GRID_TOTAL);
+
     for (int y = 0; y < GRID_SIZE; y++) {
         for (int x = 0; x < GRID_SIZE; x++) {
             uint32_t idx = (uint32_t)(y * GRID_SIZE + x);
@@ -16,54 +25,85 @@ void update_rgb_directional(SpatialGrid* grid) {
             /* R: diagonal (morpheme/semantic) */
             int dx[4] = {1, 1, -1, -1};
             int dy[4] = {1, -1, 1, -1};
+            int diff_r_sum = 0;
+            int r_neighbors = 0;
             for (int d = 0; d < 4; d++) {
                 int nx = x + dx[d], ny = y + dy[d];
                 if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE) {
                     uint32_t nidx = (uint32_t)(ny * GRID_SIZE + nx);
                     if (grid->A[nidx] > 0) {
-                        int diff = (int)grid->R[nidx] - (int)grid->R[idx];
-                        int delta = (int)(ALPHA_R * diff);
-                        int new_val = (int)grid->R[idx] + delta;
-                        if (new_val < 0) new_val = 0;
-                        if (new_val > 255) new_val = 255;
-                        grid->R[idx] = (uint8_t)new_val;
+                        diff_r_sum += (int)oldR[nidx] - (int)oldR[idx];
+                        r_neighbors++;
                     }
                 }
             }
+            if (r_neighbors > 0) {
+                float d = ALPHA_R * ((float)diff_r_sum / (float)r_neighbors);
+                int delta = (int)lrintf(d);
+                if (delta == 0 && diff_r_sum != 0) {
+                    delta = (diff_r_sum > 0) ? 1 : -1;
+                }
+                int new_val = (int)oldR[idx] + delta;
+                if (new_val < 0) new_val = 0;
+                if (new_val > 255) new_val = 255;
+                newR[idx] = (uint8_t)new_val;
+            }
 
             /* G: vertical (word substitution) */
+            int diff_g_sum = 0;
+            int g_neighbors = 0;
             for (int d = -1; d <= 1; d += 2) {
                 int ny = y + d;
                 if (ny >= 0 && ny < GRID_SIZE) {
                     uint32_t nidx = (uint32_t)(ny * GRID_SIZE + x);
                     if (grid->A[nidx] > 0) {
-                        int diff = (int)grid->G[nidx] - (int)grid->G[idx];
-                        int delta = (int)(BETA_G * diff);
-                        int new_val = (int)grid->G[idx] + delta;
-                        if (new_val < 0) new_val = 0;
-                        if (new_val > 255) new_val = 255;
-                        grid->G[idx] = (uint8_t)new_val;
+                        diff_g_sum += (int)oldG[nidx] - (int)oldG[idx];
+                        g_neighbors++;
                     }
                 }
             }
+            if (g_neighbors > 0) {
+                float d = BETA_G * ((float)diff_g_sum / (float)g_neighbors);
+                int delta = (int)lrintf(d);
+                if (delta == 0 && diff_g_sum != 0) {
+                    delta = (diff_g_sum > 0) ? 1 : -1;
+                }
+                int new_val = (int)oldG[idx] + delta;
+                if (new_val < 0) new_val = 0;
+                if (new_val > 255) new_val = 255;
+                newG[idx] = (uint8_t)new_val;
+            }
 
             /* B: horizontal (clause order) */
+            int diff_b_sum = 0;
+            int b_neighbors = 0;
             for (int d = -1; d <= 1; d += 2) {
                 int nx = x + d;
                 if (nx >= 0 && nx < GRID_SIZE) {
                     uint32_t nidx = (uint32_t)(y * GRID_SIZE + nx);
                     if (grid->A[nidx] > 0) {
-                        int diff = (int)grid->B[nidx] - (int)grid->B[idx];
-                        int delta = (int)(GAMMA_B * diff);
-                        int new_val = (int)grid->B[idx] + delta;
-                        if (new_val < 0) new_val = 0;
-                        if (new_val > 255) new_val = 255;
-                        grid->B[idx] = (uint8_t)new_val;
+                        diff_b_sum += (int)oldB[nidx] - (int)oldB[idx];
+                        b_neighbors++;
                     }
                 }
             }
+            if (b_neighbors > 0) {
+                float d = GAMMA_B * ((float)diff_b_sum / (float)b_neighbors);
+                int delta = (int)lrintf(d);
+                if (delta == 0 && diff_b_sum != 0) {
+                    delta = (diff_b_sum > 0) ? 1 : -1;
+                }
+                int new_val = (int)oldB[idx] + delta;
+                if (new_val < 0) new_val = 0;
+                if (new_val > 255) new_val = 255;
+                newB[idx] = (uint8_t)new_val;
+            }
         }
     }
+
+    memcpy(grid->R, newR, GRID_TOTAL);
+    memcpy(grid->G, newG, GRID_TOTAL);
+    memcpy(grid->B, newB, GRID_TOTAL);
 }
 
 /* ── Overlap score (Coarse filter §9.3) ── */

@@ -1,6 +1,35 @@
 #include "spatial_layers.h"
 #include <string.h>
 
+static int is_space_byte(uint8_t c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static int pos_is_content(PartOfSpeech pos) {
+    return pos == POS_NOUN || pos == POS_VERB || pos == POS_ADJ || pos == POS_UNKNOWN;
+}
+
+static void seed_rg_token(SpatialGrid* grid, uint32_t idx, PartOfSpeech pos) {
+    uint8_t r_seed = 0;
+    uint8_t g_seed = 0;
+
+    switch (pos) {
+        case POS_NOUN:     r_seed = 40;  g_seed = 30;  break;
+        case POS_VERB:     r_seed = 120; g_seed = 40;  break;
+        case POS_ADJ:      r_seed = 170; g_seed = 35;  break;
+        case POS_PARTICLE: r_seed = 8;   g_seed = 85;  break;
+        case POS_ENDING:   r_seed = 12;  g_seed = 95;  break;
+        case POS_PUNCT:    r_seed = 5;   g_seed = 120; break;
+        case POS_UNKNOWN:  r_seed = 210; g_seed = 20;  break;
+    }
+
+    if (grid->R[idx] == 0) grid->R[idx] = r_seed;
+    else grid->R[idx] = (uint8_t)(((uint16_t)grid->R[idx] + (uint16_t)r_seed) / 2u);
+
+    if (grid->G[idx] == 0) grid->G[idx] = g_seed;
+    else grid->G[idx] = (uint8_t)(((uint16_t)grid->G[idx] + (uint16_t)g_seed) / 2u);
+}
+
 LayerBitmaps* layers_create(void) {
     LayerBitmaps* lb = (LayerBitmaps*)malloc(sizeof(LayerBitmaps));
     if (!lb) return NULL;
@@ -53,39 +82,116 @@ static void layer_encode_words(const char* text, uint16_t* layer, uint16_t weigh
 /* Encode morphemes: analyze each word, then encode morpheme tokens
    at their original byte positions */
 static void layer_encode_morphemes(const char* text, uint16_t* layer, uint16_t weight) {
-    Morpheme morphs[128];
-    uint32_t n = morpheme_tokenize_clause(text, morphs, 128);
-
-    /* For morpheme layer, we re-encode the original bytes at original positions.
-       The morpheme analysis confirms which bytes belong to content morphemes.
-       Since we encode at original byte positions, we just re-encode the full
-       text bytes for tokens that are content (noun, verb, adj, morpheme parts). */
-    /* Simplified: encode all non-space bytes from the clause, matching base layer
-       coverage. The morpheme layer captures the same positions with +1 weight. */
     const uint8_t* bytes = (const uint8_t*)text;
     uint32_t total_len = (uint32_t)strlen(text);
+    uint32_t pos = 0;
 
-    /* Track byte position in original text per morpheme */
-    uint32_t byte_pos = 0;
-    for (uint32_t m = 0; m < n; m++) {
-        uint32_t tlen = (uint32_t)strlen(morphs[m].token);
-        /* Find this token in text starting from byte_pos */
-        const char* found = strstr(text + byte_pos, morphs[m].token);
-        if (found) {
-            uint32_t start = (uint32_t)(found - text);
+    while (pos < total_len) {
+        while (pos < total_len && is_space_byte(bytes[pos])) pos++;
+        if (pos >= total_len) break;
+
+        uint32_t word_start = pos;
+        while (pos < total_len && !is_space_byte(bytes[pos])) pos++;
+        uint32_t word_end = pos;
+        uint32_t word_len = word_end - word_start;
+        if (word_len == 0 || word_len >= 255) continue;
+
+        char word[256];
+        memcpy(word, text + word_start, word_len);
+        word[word_len] = '\0';
+
+        Morpheme morphs[32];
+        uint32_t n = morpheme_analyze(word, morphs, 32);
+        uint32_t local = 0;
+
+        for (uint32_t m = 0; m < n; m++) {
+            uint32_t tlen = (uint32_t)strlen(morphs[m].token);
+            if (tlen == 0 || tlen > word_len) continue;
+
+            uint32_t found = UINT32_MAX;
+            if (local + tlen <= word_len &&
+                memcmp(word + local, morphs[m].token, tlen) == 0) {
+                found = local;
+            } else {
+                for (uint32_t j = local; j + tlen <= word_len; j++) {
+                    if (memcmp(word + j, morphs[m].token, tlen) == 0) {
+                        found = j;
+                        break;
+                    }
+                }
+            }
+            if (found == UINT32_MAX) continue;
+
+            if (pos_is_content(morphs[m].pos)) {
+                for (uint32_t i = 0; i < tlen; i++) {
+                    uint32_t bi = word_start + found + i;
+                    uint32_t x = bytes[bi];
+                    uint32_t y = bi % GRID_SIZE;
+                    uint32_t idx = y * GRID_SIZE + x;
+                    uint32_t new_val = (uint32_t)layer[idx] + weight;
+                    layer[idx] = (new_val > 65535) ? 65535 : (uint16_t)new_val;
+                }
+            }
+            local = found + tlen;
+        }
+    }
+}
+
+/* Seed R/G channels from morpheme POS at original byte positions.
+   This gives tile-level semantic/function priors before directional diffusion. */
+static void seed_morpheme_rg(const char* text, SpatialGrid* out_combined) {
+    const uint8_t* bytes = (const uint8_t*)text;
+    uint32_t total_len = (uint32_t)strlen(text);
+    uint32_t pos = 0;
+
+    while (pos < total_len) {
+        while (pos < total_len && is_space_byte(bytes[pos])) pos++;
+        if (pos >= total_len) break;
+
+        uint32_t word_start = pos;
+        while (pos < total_len && !is_space_byte(bytes[pos])) pos++;
+        uint32_t word_end = pos;
+        uint32_t word_len = word_end - word_start;
+        if (word_len == 0 || word_len >= 255) continue;
+
+        char word[256];
+        memcpy(word, text + word_start, word_len);
+        word[word_len] = '\0';
+
+        Morpheme morphs[32];
+        uint32_t n = morpheme_analyze(word, morphs, 32);
+        uint32_t local = 0;
+
+        for (uint32_t m = 0; m < n; m++) {
+            uint32_t tlen = (uint32_t)strlen(morphs[m].token);
+            if (tlen == 0 || tlen > word_len) continue;
+
+            uint32_t found = UINT32_MAX;
+            if (local + tlen <= word_len &&
+                memcmp(word + local, morphs[m].token, tlen) == 0) {
+                found = local;
+            } else {
+                for (uint32_t j = local; j + tlen <= word_len; j++) {
+                    if (memcmp(word + j, morphs[m].token, tlen) == 0) {
+                        found = j;
+                        break;
+                    }
+                }
+            }
+            if (found == UINT32_MAX) continue;
+
             for (uint32_t i = 0; i < tlen; i++) {
-                uint32_t bi = start + i;
-                if (bi >= total_len) break;
+                uint32_t bi = word_start + found + i;
                 uint32_t x = bytes[bi];
                 uint32_t y = bi % GRID_SIZE;
                 uint32_t idx = y * GRID_SIZE + x;
-                uint32_t new_val = (uint32_t)layer[idx] + weight;
-                layer[idx] = (new_val > 65535) ? 65535 : (uint16_t)new_val;
+                if (out_combined->A[idx] > 0) {
+                    seed_rg_token(out_combined, idx, morphs[m].pos);
+                }
             }
-            byte_pos = start + tlen;
+            local = found + tlen;
         }
     }
-    (void)byte_pos;
 }
 
 /* Seed B channel with a co-occurrence hash of the clause's unique active
@@ -144,6 +250,9 @@ void layers_encode_clause(const char* clause_text,
         uint32_t sum = (uint32_t)lb->base[i] + lb->word[i] + lb->morpheme[i];
         out_combined->A[i] = (sum > 65535) ? 65535 : (uint16_t)sum;
     }
+
+    /* Seed R/G before diffusion, based on morpheme POS alignment. */
+    seed_morpheme_rg(clause_text, out_combined);
 
     /* Seed B with the clause's co-occurrence hash BEFORE RGB diffusion.
      * Callers who subsequently run update_rgb_directional will still see
