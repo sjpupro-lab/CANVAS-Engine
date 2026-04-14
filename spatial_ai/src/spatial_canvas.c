@@ -8,6 +8,53 @@
 #include <string.h>
 #include <math.h>
 
+/* ── DataType classification ────────────────────────────── */
+
+static const char SPECIAL_CHARS[] = "{}()[];=<>#@$&|\\/";
+
+DataType detect_data_type(const uint8_t* bytes, uint32_t len) {
+    if (!bytes || len == 0) return DATA_SHORT;
+
+    uint32_t special = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t b = bytes[i];
+        if (b < 128 && b > 0 && strchr(SPECIAL_CHARS, (int)b)) special++;
+    }
+    float special_ratio = (float)special / (float)len;
+
+    if (special_ratio > 0.15f) return DATA_CODE;
+    if (len < 30)               return DATA_SHORT;
+    if (len > 150)              return DATA_PROSE;
+    return DATA_DIALOG;
+}
+
+const char* data_type_name(DataType t) {
+    switch (t) {
+        case DATA_PROSE:  return "PROSE";
+        case DATA_DIALOG: return "DIALOG";
+        case DATA_CODE:   return "CODE";
+        case DATA_SHORT:  return "SHORT";
+        default:          return "?";
+    }
+}
+
+float data_type_boundary_weight(DataType t) {
+    switch (t) {
+        case DATA_PROSE:  return 0.5f;
+        case DATA_DIALOG: return 0.3f;
+        case DATA_CODE:   return 0.1f;
+        case DATA_SHORT:  return 0.02f;
+        default:          return 0.5f;
+    }
+}
+
+/* djb2 topic hash used by canvas_add_clause */
+static uint32_t topic_hash_djb2(const char* s) {
+    uint32_t h = 5381;
+    while (*s) h = h * 33u + (uint8_t)(*s++);
+    return h;
+}
+
 #ifdef _WIN32
 #include <malloc.h>
 static void* cv_aligned(size_t alignment, size_t size) {
@@ -45,6 +92,16 @@ SpatialCanvas* canvas_create(void) {
     c->width  = CV_WIDTH;
     c->height = CV_HEIGHT;
     c->slot_count = 0;
+    c->canvas_type = DATA_PROSE;  /* overwritten by first placement */
+    /* Default meta: unoccupied, full-weight boundaries so canvases
+     * that never call canvas_add_clause still diffuse uniformly. */
+    for (uint32_t s = 0; s < CV_SLOTS; s++) {
+        c->meta[s].type = DATA_PROSE;
+        c->meta[s].boundary_weight = 1.0f;
+        c->meta[s].byte_length = 0;
+        c->meta[s].topic_hash = 0;
+        c->meta[s].occupied = 0;
+    }
     return c;
 }
 
@@ -64,6 +121,13 @@ void canvas_clear(SpatialCanvas* c) {
     memset(c->G, 0, CV_TOTAL);
     memset(c->B, 0, CV_TOTAL);
     c->slot_count = 0;
+    for (uint32_t s = 0; s < CV_SLOTS; s++) {
+        c->meta[s].type = DATA_PROSE;
+        c->meta[s].boundary_weight = 1.0f;
+        c->meta[s].byte_length = 0;
+        c->meta[s].topic_hash = 0;
+        c->meta[s].occupied = 0;
+    }
 }
 
 /* ── Slot → canvas-space coordinate helpers ────────────── */
@@ -110,11 +174,40 @@ int canvas_add_clause(SpatialCanvas* c, const char* text) {
     }
 
     grid_destroy(tile);
+
+    /* Populate meta for this slot from the clause's auto-detected type */
+    uint32_t text_len = (uint32_t)strlen(text);
+    DataType t = detect_data_type((const uint8_t*)text, text_len);
+    c->meta[slot].type            = t;
+    c->meta[slot].boundary_weight = data_type_boundary_weight(t);
+    c->meta[slot].byte_length     = text_len;
+    c->meta[slot].topic_hash      = topic_hash_djb2(text);
+    c->meta[slot].occupied        = 1;
+
+    /* First placement sets the canvas's overall type */
+    if (c->slot_count == 0) c->canvas_type = t;
+
     c->slot_count++;
     return (int)slot;
 }
 
 /* ── Canvas-wide RGB directional diffusion ─────────────── */
+
+/* Return the boundary-diffusion multiplier for an update that flows
+ *   from (sx, sy) into (dx, dy). Within the same slot the multiplier
+ *   is 1.0; crossing a slot boundary uses the min of the two slots'
+ *   boundary_weight. */
+static inline float boundary_multiplier(const SpatialCanvas* c,
+                                        uint32_t sx, uint32_t sy,
+                                        uint32_t dx, uint32_t dy) {
+    uint32_t s1 = (sy / CV_TILE) * CV_COLS + (sx / CV_TILE);
+    uint32_t s2 = (dy / CV_TILE) * CV_COLS + (dx / CV_TILE);
+    if (s1 == s2) return 1.0f;
+    if (s1 >= CV_SLOTS || s2 >= CV_SLOTS) return 1.0f;
+    float w1 = c->meta[s1].boundary_weight;
+    float w2 = c->meta[s2].boundary_weight;
+    return (w1 < w2) ? w1 : w2;
+}
 
 void canvas_update_rgb(SpatialCanvas* c) {
     if (!c) return;
@@ -127,15 +220,16 @@ void canvas_update_rgb(SpatialCanvas* c) {
             if (c->A[i] == 0) continue;
 
             /* R: diagonal neighbours (semantic / morpheme relation) */
-            static const int dx[4] = {1, 1, -1, -1};
-            static const int dy[4] = {1, -1, 1, -1};
+            static const int dx_off[4] = {1, 1, -1, -1};
+            static const int dy_off[4] = {1, -1, 1, -1};
             for (int d = 0; d < 4; d++) {
-                int nx = (int)x + dx[d], ny = (int)y + dy[d];
+                int nx = (int)x + dx_off[d], ny = (int)y + dy_off[d];
                 if (nx < 0 || nx >= (int)W || ny < 0 || ny >= (int)H) continue;
                 uint32_t ni = (uint32_t)ny * W + (uint32_t)nx;
                 if (c->A[ni] == 0) continue;
+                float bw = boundary_multiplier(c, (uint32_t)nx, (uint32_t)ny, x, y);
                 int diff = (int)c->R[ni] - (int)c->R[i];
-                int new_v = (int)c->R[i] + (int)(ALPHA_R * diff);
+                int new_v = (int)c->R[i] + (int)(ALPHA_R * diff * bw);
                 if (new_v < 0) new_v = 0;
                 if (new_v > 255) new_v = 255;
                 c->R[i] = (uint8_t)new_v;
@@ -146,8 +240,9 @@ void canvas_update_rgb(SpatialCanvas* c) {
                 if (ny < 0 || ny >= (int)H) continue;
                 uint32_t ni = (uint32_t)ny * W + x;
                 if (c->A[ni] == 0) continue;
+                float bw = boundary_multiplier(c, x, (uint32_t)ny, x, y);
                 int diff = (int)c->G[ni] - (int)c->G[i];
-                int new_v = (int)c->G[i] + (int)(BETA_G * diff);
+                int new_v = (int)c->G[i] + (int)(BETA_G * diff * bw);
                 if (new_v < 0) new_v = 0;
                 if (new_v > 255) new_v = 255;
                 c->G[i] = (uint8_t)new_v;
@@ -158,8 +253,9 @@ void canvas_update_rgb(SpatialCanvas* c) {
                 if (nx < 0 || nx >= (int)W) continue;
                 uint32_t ni = y * W + (uint32_t)nx;
                 if (c->A[ni] == 0) continue;
+                float bw = boundary_multiplier(c, (uint32_t)nx, y, x, y);
                 int diff = (int)c->B[ni] - (int)c->B[i];
-                int new_v = (int)c->B[i] + (int)(GAMMA_B * diff);
+                int new_v = (int)c->B[i] + (int)(GAMMA_B * diff * bw);
                 if (new_v < 0) new_v = 0;
                 if (new_v > 255) new_v = 255;
                 c->B[i] = (uint8_t)new_v;

@@ -44,11 +44,13 @@
  */
 
 #define SPAI_MAGIC    "SPAI"
-#define SPAI_VERSION  2u       /* v2 adds ChannelWeight block after records */
+#define SPAI_VERSION  3u       /* v3 adds canvas pool + subtitle track */
 
 #define SPAI_TAG_KEYFRAME  0x01
 #define SPAI_TAG_DELTA     0x02
 #define SPAI_TAG_WEIGHTS   0x03   /* ChannelWeight block: 4 × float */
+#define SPAI_TAG_CANVAS    0x04   /* One SpatialCanvas (v3) */
+#define SPAI_TAG_SUBTITLE  0x05   /* SubtitleTrack (v3) */
 
 typedef enum {
     SPAI_OK = 0,

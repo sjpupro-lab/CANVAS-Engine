@@ -40,6 +40,7 @@ typedef struct {
 /* Main AI engine structure.
  * Named struct (SpatialAI_) so spatial_match.h can forward-declare it
  * for the cascade API without a circular include. */
+struct SpatialCanvasPool_;  /* fwd-decl; see spatial_subtitle.h */
 typedef struct SpatialAI_ {
     Keyframe*     keyframes;
     uint32_t      kf_count;
@@ -52,7 +53,16 @@ typedef struct SpatialAI_ {
      * Initialised to (1, 1, 1, 1) by spatial_ai_create; updated
      * automatically after each ai_store_auto by the engine. */
     ChannelWeight global_weights;
+
+    /* Optional canvas pool (SPEC §6 + SubtitleTrack). NULL until
+     * ai_get_canvas_pool(ai) is called. */
+    struct SpatialCanvasPool_* canvas_pool;
 } SpatialAI;
+
+/* Forward declarations that avoid pulling spatial_subtitle.h into
+ * every translation unit that needs SpatialAI. */
+struct SpatialCanvasPool_* ai_get_canvas_pool(SpatialAI* ai);  /* lazy create */
+void                       ai_release_canvas_pool(SpatialAI* ai); /* destroy+NULL */
 
 /* Create/destroy engine */
 SpatialAI* spatial_ai_create(void);

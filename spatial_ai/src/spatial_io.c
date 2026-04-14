@@ -1,5 +1,7 @@
 #include "spatial_io.h"
 #include "spatial_grid.h"
+#include "spatial_canvas.h"
+#include "spatial_subtitle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,6 +181,106 @@ static SpaiStatus read_weights_body(FILE* fp, ChannelWeight* w) {
     return SPAI_OK;
 }
 
+/* ── Canvas record: tag 0x04 ──
+ * Layout (all little-endian native):
+ *   uint32 slot_count
+ *   uint32 canvas_type
+ *   SlotMeta meta[CV_SLOTS]   (24 bytes each: 4+4+4+4+4 padded)
+ *   uint16 A[CV_TOTAL]
+ *   uint8  R[CV_TOTAL]
+ *   uint8  G[CV_TOTAL]
+ *   uint8  B[CV_TOTAL]
+ * Canvas width / height are fixed by CV_WIDTH / CV_HEIGHT. */
+static SpaiStatus write_canvas_record(FILE* fp, const SpatialCanvas* c) {
+    uint8_t tag = SPAI_TAG_CANVAS;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+
+    uint32_t stype = (uint32_t)c->canvas_type;
+    if (fwrite(&c->slot_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&stype,         sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+
+    /* Serialize SlotMeta as explicit fields to avoid struct padding issues */
+    for (uint32_t s = 0; s < CV_SLOTS; s++) {
+        uint32_t t = (uint32_t)c->meta[s].type;
+        float    bw = c->meta[s].boundary_weight;
+        uint32_t bl = c->meta[s].byte_length;
+        uint32_t th = c->meta[s].topic_hash;
+        uint32_t oc = (uint32_t)c->meta[s].occupied;
+        if (fwrite(&t,  4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&bw, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&bl, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&th, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&oc, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+    }
+    if (fwrite(c->A, sizeof(uint16_t), CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_WRITE;
+    if (fwrite(c->R, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_WRITE;
+    if (fwrite(c->G, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_WRITE;
+    if (fwrite(c->B, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_WRITE;
+    return SPAI_OK;
+}
+
+static SpaiStatus read_canvas_body(FILE* fp, SpatialCanvas* c) {
+    uint32_t stype = 0;
+    if (fread(&c->slot_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&stype,         sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    c->canvas_type = (DataType)stype;
+
+    for (uint32_t s = 0; s < CV_SLOTS; s++) {
+        uint32_t t = 0, bl = 0, th = 0, oc = 0;
+        float    bw = 1.0f;
+        if (fread(&t,  4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&bw, 4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&bl, 4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&th, 4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&oc, 4, 1, fp) != 1) return SPAI_ERR_READ;
+        c->meta[s].type = (DataType)t;
+        c->meta[s].boundary_weight = bw;
+        c->meta[s].byte_length = bl;
+        c->meta[s].topic_hash  = th;
+        c->meta[s].occupied    = (int)oc;
+    }
+    if (fread(c->A, sizeof(uint16_t), CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_READ;
+    if (fread(c->R, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_READ;
+    if (fread(c->G, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_READ;
+    if (fread(c->B, 1, CV_TOTAL, fp) != CV_TOTAL) return SPAI_ERR_READ;
+    return SPAI_OK;
+}
+
+/* ── Subtitle record: tag 0x05 ──
+ * Layout:
+ *   uint32 count
+ *   for each: type(u32) topic_hash(u32) canvas_id(u32) slot_id(u32) byte_length(u32) */
+static SpaiStatus write_subtitle_record(FILE* fp, const SubtitleTrack* t) {
+    uint8_t tag = SPAI_TAG_SUBTITLE;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&t->count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    for (uint32_t i = 0; i < t->count; i++) {
+        const SubtitleEntry* e = &t->entries[i];
+        uint32_t type = (uint32_t)e->type;
+        if (fwrite(&type,           4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->topic_hash,  4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->canvas_id,   4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->slot_id,     4, 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->byte_length, 4, 1, fp) != 1) return SPAI_ERR_WRITE;
+    }
+    return SPAI_OK;
+}
+
+static SpaiStatus read_subtitle_body(FILE* fp, SubtitleTrack* t) {
+    uint32_t count = 0;
+    if (fread(&count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t type = 0, topic = 0, cv = 0, sl = 0, bl = 0;
+        if (fread(&type,  4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&topic, 4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&cv,    4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&sl,    4, 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&bl,    4, 1, fp) != 1) return SPAI_ERR_READ;
+        subtitle_track_add(t, (DataType)type, topic, cv, sl, bl);
+    }
+    return SPAI_OK;
+}
+
 SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     if (!ai || !path) return SPAI_ERR_OPEN;
 
@@ -202,6 +304,18 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     /* v2: adaptive channel weights as trailing record */
     s = write_weights_record(fp, &ai->global_weights);
     if (s != SPAI_OK) { fclose(fp); return s; }
+
+    /* v3: canvases (if any) then subtitle track */
+    if (ai->canvas_pool) {
+        for (uint32_t i = 0; i < ai->canvas_pool->count; i++) {
+            SpatialCanvas* c = ai->canvas_pool->canvases[i];
+            if (!c) continue;
+            s = write_canvas_record(fp, c);
+            if (s != SPAI_OK) { fclose(fp); return s; }
+        }
+        s = write_subtitle_record(fp, &ai->canvas_pool->track);
+        if (s != SPAI_OK) { fclose(fp); return s; }
+    }
 
     if (fclose(fp) != 0) return SPAI_ERR_WRITE;
     return SPAI_OK;
@@ -277,7 +391,8 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
     ai->kf_count = kfs_read;
     ai->df_count = dfs_read;
 
-    /* Optional trailing records (v2+): weights */
+    /* Optional trailing records: weights (v2+) and canvas + subtitle (v3+).
+     * Keep reading tagged records until EOF or unknown tag. */
     uint8_t tag;
     while (fread(&tag, 1, 1, fp) == 1) {
         if (tag == SPAI_TAG_WEIGHTS) {
@@ -287,16 +402,65 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 if (out_status) *out_status = s;
                 return NULL;
             }
-            /* weight_normalize defensively in case the on-disk values
-             * drifted from the sum = 4 invariant. */
             weight_normalize(&ai->global_weights);
+        } else if (tag == SPAI_TAG_CANVAS) {
+            /* Lazy-create pool on first canvas record */
+            SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
+            if (!pool) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = SPAI_ERR_ALLOC;
+                return NULL;
+            }
+            SpatialCanvas* cv = canvas_create();
+            if (!cv) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = SPAI_ERR_ALLOC;
+                return NULL;
+            }
+            s = read_canvas_body(fp, cv);
+            if (s != SPAI_OK) {
+                canvas_destroy(cv);
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
+            /* Append to pool.canvases (reuse realloc logic inline) */
+            if (pool->count >= pool->capacity) {
+                uint32_t nc = pool->capacity ? pool->capacity * 2 : 4;
+                SpatialCanvas** arr = (SpatialCanvas**)realloc(pool->canvases,
+                                              nc * sizeof(*pool->canvases));
+                if (!arr) {
+                    canvas_destroy(cv);
+                    fclose(fp); spatial_ai_destroy(ai);
+                    if (out_status) *out_status = SPAI_ERR_ALLOC;
+                    return NULL;
+                }
+                pool->canvases = arr;
+                pool->capacity = nc;
+            }
+            pool->canvases[pool->count++] = cv;
+        } else if (tag == SPAI_TAG_SUBTITLE) {
+            SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
+            if (!pool) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = SPAI_ERR_ALLOC;
+                return NULL;
+            }
+            /* Fresh-load the track (subtitle_track_destroy + init is
+             * a no-op if already clean, but be explicit). */
+            subtitle_track_destroy(&pool->track);
+            subtitle_track_init(&pool->track);
+            s = read_subtitle_body(fp, &pool->track);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
         } else {
             /* Unknown trailing tag — stop cleanly, forward compatible. */
             break;
         }
     }
-    /* If file had no weights block (v1 file), global_weights stays at
-     * the default set by spatial_ai_create. */
 
     fclose(fp);
     if (out_status) *out_status = SPAI_OK;

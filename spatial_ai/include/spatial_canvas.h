@@ -45,6 +45,39 @@
 #define CV_HEIGHT     (CV_TILE * CV_ROWS)       /* 1024 */
 #define CV_TOTAL      (CV_WIDTH * CV_HEIGHT)    /* 2,097,152 cells */
 
+/* ── DataType — automatic classification of clauses ──────
+ * Decides how strongly RGB diffusion flows across the slot
+ * boundary into neighbouring tiles. Prose chapters lean on
+ * each other; code blocks are independent; short dictionary
+ * entries are fully isolated. */
+typedef enum {
+    DATA_PROSE  = 0,   /* len > 150 ASCII text, narrative flow */
+    DATA_DIALOG = 1,   /* len 30..150, conversational turns */
+    DATA_CODE   = 2,   /* special-char ratio > 15%, programming */
+    DATA_SHORT  = 3,   /* len < 30, single words / dictionary */
+    DATA_TYPE_COUNT = 4
+} DataType;
+
+/* Inspect a byte range and classify it into a DataType.
+ * Rule order: CODE (by special chars) > SHORT (by length) >
+ * PROSE (by length) > DIALOG (default). */
+DataType    detect_data_type(const uint8_t* bytes, uint32_t len);
+const char* data_type_name(DataType t);
+
+/* Per-type boundary diffusion weight used by canvas_update_rgb at
+ * slot boundaries. Values from user spec:
+ *   PROSE  0.5  DIALOG 0.3  CODE 0.1  SHORT 0.02 */
+float       data_type_boundary_weight(DataType t);
+
+/* Per-slot metadata. Populated by canvas_add_clause. */
+typedef struct {
+    DataType type;
+    float    boundary_weight;
+    uint32_t byte_length;     /* original clause byte count */
+    uint32_t topic_hash;      /* djb2 over the clause text */
+    int      occupied;        /* 1 after first placement, 0 otherwise */
+} SlotMeta;
+
 typedef struct {
     uint16_t* A;            /* 32-byte aligned, 2 bytes per cell */
     uint8_t*  R;
@@ -53,6 +86,9 @@ typedef struct {
     uint32_t  width;        /* CV_WIDTH */
     uint32_t  height;       /* CV_HEIGHT */
     uint32_t  slot_count;   /* clauses placed so far (0 … CV_SLOTS) */
+    DataType  canvas_type;  /* set by the first placed clause; canvases
+                               in a pool are typically type-homogeneous */
+    SlotMeta  meta[CV_SLOTS];
 } SpatialCanvas;
 
 /* Lifecycle */

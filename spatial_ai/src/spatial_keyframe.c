@@ -1,5 +1,6 @@
 #include "spatial_keyframe.h"
 #include "spatial_layers.h"
+#include "spatial_subtitle.h"   /* SpatialCanvasPool for ai_get_canvas_pool */
 #include <string.h>
 #include <stdio.h>
 
@@ -20,6 +21,9 @@ SpatialAI* spatial_ai_create(void) {
 
     /* Adaptive channel weights start uniform */
     weight_init(&ai->global_weights);
+
+    /* Canvas pool is lazily created on first ai_get_canvas_pool() call */
+    ai->canvas_pool = NULL;
 
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
@@ -55,7 +59,26 @@ void spatial_ai_destroy(SpatialAI* ai) {
         free(ai->deltas);
     }
 
+    if (ai->canvas_pool) {
+        pool_destroy(ai->canvas_pool);
+        ai->canvas_pool = NULL;
+    }
+
     free(ai);
+}
+
+/* ── Lazy canvas-pool accessors ── */
+
+SpatialCanvasPool* ai_get_canvas_pool(SpatialAI* ai) {
+    if (!ai) return NULL;
+    if (!ai->canvas_pool) ai->canvas_pool = pool_create();
+    return ai->canvas_pool;
+}
+
+void ai_release_canvas_pool(SpatialAI* ai) {
+    if (!ai || !ai->canvas_pool) return;
+    pool_destroy(ai->canvas_pool);
+    ai->canvas_pool = NULL;
 }
 
 /* Grow keyframe array if needed */
