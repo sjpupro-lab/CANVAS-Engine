@@ -1,35 +1,59 @@
 /*
- * bench_qa.c — SQuAD-style retrieval QA via SPEC matching + context frames
+ * bench_qa.c — SQuAD-style QA via context frames + B×G×R extraction
  *
- * Pipeline (user spec + SPEC §7, §9):
+ * SPEC alignment:
  *
- *   Training (70% of pairs)
- *     For each QA pair (q_i, a_i), store Q_i then A_i as consecutive
- *     keyframes. Frame sequence: [Q_0, A_0, Q_1, A_1, ...]. Every
- *     stored clause goes through the full 3-layer + RGB-directional
- *     update, so keyframes carry learned R/G/B channels.
+ *   §7  Context frames are sequential "clause frames". Same-source
+ *       clauses share contiguous frame_ids. Questions are matched
+ *       against the frame pool, not directly against answers.
  *
- *   Testing (30% of pairs — unseen)
- *     For each (q_test, a_test):
- *       1. Encode q_test through full pipeline (3-layer + RGB-diffusion)
- *       2. match_engine finds best-matching keyframe (RGB-weighted
- *          cosine via SPEC §9.4 cosine_rgb_weighted)
- *       3. Candidate pool = matched keyframe ± N neighbor frames
- *       4. Rank candidates by:
- *            rgb_cosine(q_test, candidate)   (question overlap / relevance)
- *            rgb_cosine(candidate, a_test)   (answer match)
- *          Combined: score = q_cos * a_cos^0 + q_cos  (rank primarily
- *          by question relevance, report answer quality separately)
- *       5. Top-1 hit = top-ranked candidate has highest a_cos
+ *   §9  Matching uses the full pipeline (3-layer encode → RGB
+ *       directional update → overlap coarse → RGB-weighted cosine).
+ *
+ *   §4, §5  Generation consults all four channels. R (diagonal) gives
+ *       semantic linkage, G (vertical) gives substitution candidates,
+ *       B (horizontal) gives clause-order direction between frames.
+ *
+ * Pipeline:
+ *
+ *   Training
+ *     Parse TSV  (question \t context \t answer).
+ *     Group by unique context string.
+ *     For each unique context:
+ *       split into clauses, store each as a consecutive ContextFrame
+ *       via context_add_frame → frame_ids are contiguous.
+ *     Record each context's (clause_start, clause_count).
+ *     Each QA pair points to its context index.
+ *
+ *   Testing (30% held-out QAs)
+ *     Step 1. Encode the question: 3-layer + RGB directional update.
+ *     Step 2. Match over the context-frame pool:
+ *               best_frame_id = argmax_i cosine_rgb_weighted(q, frame[i])
+ *     Step 3. Directional extraction over window = best ±N frames:
+ *               For every byte position (y, x) in any window frame:
+ *                 novelty = frame.A[y,x] - question.A[y,x]   (≥0 only)
+ *                 R_sim   = 1 - |frame.R[y,x] - q_sig.R_row[y]| / 255
+ *                 G_sim   = 1 - |frame.G[y,x] - q_sig.G_row[y]| / 255
+ *                 B_sim   = 1 - |frame.B[y,x] - q_sig.B_row[y]| / 255
+ *                 score   = novelty × R_sim × G_sim × B_sim
+ *               Per-frame density → pick frame with highest avg score.
+ *               Within that frame, argmax x per row produces bytes in
+ *               the score-active Y range.
+ *     Step 4. Assemble: sort by (frame_id, y) ascending (= B-channel /
+ *             horizontal clause order). Emit the byte stream.
  *
  * Metrics
- *   - Retrieval@1 / @5 against the true paired answer frame
- *   - Answer cosine (RGB-weighted) vs random baseline
- *   - Lift over random-keyframe baseline
+ *   Context Retrieval   — best_frame_id lands inside gold context range
+ *   Answer EM            — exact match after normalization
+ *   Answer F1            — word-level precision/recall harmonic mean
+ *
+ * TSV  (one row per QA pair):
+ *     question \t context \t answer
  *
  * Usage
- *   ./build/bench_qa data/qa.tsv
- *   ./build/bench_qa data/qa.tsv 500
+ *   ./build/bench_qa data/qa_en.txt
+ *   ./build/bench_qa data/qa_en.txt 500
+ *   ./build/bench_qa data/qa_en.txt --save model.spai
  */
 
 #include "spatial_grid.h"
@@ -47,45 +71,357 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 #include <time.h>
 
-#define MAX_PAIRS       8000
-#define MAX_LINE_LEN    4096
+/* ── configuration ── */
+#define MAX_LINE_LEN    16384
+#define MAX_QA_PAIRS    8000
+#define MAX_CONTEXTS    4000
+#define MAX_CLAUSES     32
+#define DEFAULT_LIMIT   500
 #define TRAIN_RATIO     0.70f
-#define DEFAULT_LIMIT   1000
-#define NEIGHBOR_RADIUS 2   /* ±N frames around matched KF */
+#define WINDOW_RADIUS   2      /* ±N frames around matched frame */
+#define MIN_CLAUSE_LEN  10
 
+/* ── timing ── */
 static double now_sec(void) {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-typedef struct { char* q; char* a; } QAPair;
+/* ── clause splitter (shared style with other benches) ── */
+static uint32_t split_clauses(const char* line, char out[][MAX_LINE_LEN],
+                              uint32_t max_out) {
+    uint32_t count = 0;
+    const char* p = line;
+    const char* start = p;
+    while (*p && count < max_out) {
+        if (*p == '.' || *p == '!' || *p == '?') {
+            uint32_t len = (uint32_t)(p - start + 1);
+            if (len >= MIN_CLAUSE_LEN && len < MAX_LINE_LEN) {
+                memcpy(out[count], start, len);
+                out[count][len] = '\0';
+                /* trim trailing whitespace */
+                int sl = (int)strlen(out[count]);
+                while (sl > 0 && (out[count][sl-1] == '\n' ||
+                                  out[count][sl-1] == '\r' ||
+                                  out[count][sl-1] == ' '))
+                    out[count][--sl] = '\0';
+                if ((int)strlen(out[count]) >= MIN_CLAUSE_LEN) count++;
+            }
+            start = p + 1;
+            while (*start == ' ') start++;
+            p = start;
+            continue;
+        }
+        p++;
+    }
+    /* tail */
+    if (start < p && count < max_out) {
+        uint32_t len = (uint32_t)(p - start);
+        if (len >= MIN_CLAUSE_LEN && len < MAX_LINE_LEN) {
+            memcpy(out[count], start, len);
+            out[count][len] = '\0';
+            count++;
+        }
+    }
+    return count;
+}
 
-/* ── TSV parsing ── */
+/* ── QA data ── */
 
-static int parse_line(const char* line, QAPair* out) {
-    const char* tab = strchr(line, '\t');
-    if (!tab) return 0;
+typedef struct {
+    char*    text;
+    uint32_t clause_start;   /* first frame_id in ContextManager */
+    uint32_t clause_count;
+    int      trained;
+} ContextEntry;
 
-    size_t q_len = (size_t)(tab - line);
-    const char* a_start = tab + 1;
-    size_t a_len = strlen(a_start);
-    while (a_len > 0 && (a_start[a_len-1] == '\n' || a_start[a_len-1] == '\r' ||
-                         a_start[a_len-1] == ' ')) a_len--;
+typedef struct {
+    int    ctx_idx;          /* into contexts[] */
+    char*  question;
+    char*  answer;
+} QAItem;
 
-    if (q_len < 3 || a_len < 3) return 0;
+/* Parse one TSV line: question \t context \t answer */
+static int parse_line(const char* line, char** q, char** c, char** a) {
+    const char* t1 = strchr(line, '\t');
+    if (!t1) return 0;
+    const char* t2 = strchr(t1 + 1, '\t');
+    if (!t2) return 0;
 
-    out->q = (char*)malloc(q_len + 1);
-    out->a = (char*)malloc(a_len + 1);
-    if (!out->q || !out->a) return 0;
-    memcpy(out->q, line, q_len); out->q[q_len] = '\0';
-    memcpy(out->a, a_start, a_len); out->a[a_len] = '\0';
+    size_t q_len = (size_t)(t1 - line);
+    size_t c_len = (size_t)(t2 - (t1 + 1));
+    size_t a_len = strlen(t2 + 1);
+    /* strip trailing whitespace on answer */
+    while (a_len > 0 && (t2[1 + a_len - 1] == '\n' ||
+                         t2[1 + a_len - 1] == '\r' ||
+                         t2[1 + a_len - 1] == ' '))
+        a_len--;
+
+    if (q_len < 2 || c_len < 10 || a_len < 1) return 0;
+
+    *q = (char*)malloc(q_len + 1);
+    *c = (char*)malloc(c_len + 1);
+    *a = (char*)malloc(a_len + 1);
+    if (!*q || !*c || !*a) return 0;
+    memcpy(*q, line,   q_len); (*q)[q_len] = '\0';
+    memcpy(*c, t1 + 1, c_len); (*c)[c_len] = '\0';
+    memcpy(*a, t2 + 1, a_len); (*a)[a_len] = '\0';
     return 1;
 }
 
-/* ── main ─────────────────────────────────────────────── */
+/* Find or add a context by string. Returns index or -1. */
+static int find_or_add_context(ContextEntry* ctxs, int* n, const char* text) {
+    for (int i = 0; i < *n; i++) {
+        if (strcmp(ctxs[i].text, text) == 0) return i;
+    }
+    if (*n >= MAX_CONTEXTS) return -1;
+    ctxs[*n].text         = strdup(text);
+    ctxs[*n].clause_start = UINT32_MAX;
+    ctxs[*n].clause_count = 0;
+    ctxs[*n].trained      = 0;
+    return (*n)++;
+}
+
+/* ── Matching over context frames — SPEC §9 2-stage pipeline ── */
+
+/* Stage 1: overlap coarse    — count co-active byte positions
+   Stage 2: RGB-weighted fine — score top-K candidates with cosine_rgb_weighted */
+static uint32_t match_context_frame(const ContextManager* cm,
+                                    const SpatialGrid* q,
+                                    float* out_sim) {
+    if (cm->frame_count == 0) { if (out_sim) *out_sim = 0.0f; return 0; }
+
+    uint32_t n = cm->frame_count;
+    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
+
+    /* ── Stage 1: overlap coarse over every context frame ── */
+    for (uint32_t i = 0; i < n; i++) {
+        pool[i].id = i;
+        pool[i].score = (float)overlap_score(q, cm->frames[i].grid);
+    }
+    uint32_t k = (TOP_K < n) ? TOP_K : n;
+    topk_select(pool, n, k);
+
+    /* ── Stage 2: RGB-weighted cosine on top-K ── */
+    uint32_t best_id  = pool[0].id;
+    float    best_sim = -1.0f;
+    for (uint32_t i = 0; i < k; i++) {
+        float s = cosine_rgb_weighted(q, cm->frames[pool[i].id].grid);
+        if (s > best_sim) { best_sim = s; best_id = pool[i].id; }
+    }
+
+    free(pool);
+    if (out_sim) *out_sim = best_sim;
+    return best_id;
+}
+
+/* ── Answer extraction: B × G × R over window ── */
+
+/* Score a single (y, x) cell per SPEC §4 §5 §9:
+     score = A × R_sim × G_sim × B_sim
+   using the question's per-row and global RGBA signatures. */
+static inline double cell_score(const SpatialGrid* frame, uint32_t y, uint32_t x,
+                                const InputSignature* q_sig) {
+    uint32_t i = y * GRID_SIZE + x;
+    if (frame->A[i] == 0) return 0.0;
+    double q_R, q_G, q_B;
+    input_signature_get(q_sig, y, &q_R, &q_G, &q_B);
+    double R_sim = 1.0 - fabs((double)frame->R[i] - q_R) / 255.0;
+    double G_sim = 1.0 - fabs((double)frame->G[i] - q_G) / 255.0;
+    double B_sim = 1.0 - fabs((double)frame->B[i] - q_B) / 255.0;
+    if (R_sim < 0) R_sim = 0;
+    if (G_sim < 0) G_sim = 0;
+    if (B_sim < 0) B_sim = 0;
+    return (double)frame->A[i] * R_sim * G_sim * B_sim;
+}
+
+/* Per-frame Y-row aggregate scores, length 256 */
+static void frame_y_scores(const SpatialGrid* frame,
+                           const InputSignature* q_sig,
+                           double* per_y) {
+    memset(per_y, 0, GRID_SIZE * sizeof(double));
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            per_y[y] += cell_score(frame, y, x, q_sig);
+        }
+    }
+}
+
+/* For each score-active row y in [y_start, y_end], emit argmax-score byte x. */
+static size_t decode_frame_range(const SpatialGrid* frame,
+                                 const InputSignature* q_sig,
+                                 uint32_t y_start, uint32_t y_end,
+                                 char* out, size_t cap) {
+    size_t ol = 0;
+    for (uint32_t y = y_start; y <= y_end && ol + 1 < cap; y++) {
+        int    best_x = -1;
+        double best_score = 0.0;
+
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            double s = cell_score(frame, y, x, q_sig);
+            if (s > best_score) {
+                best_score = s;
+                best_x = (int)x;
+            }
+        }
+        if (best_x >= 0) out[ol++] = (char)(uint8_t)best_x;
+    }
+    out[ol] = '\0';
+    return ol;
+}
+
+/* Extraction per user spec:
+     window  = match ± radius  (B channel / horizontal clause order)
+     For each frame in the window we compute per-row A × R_sim × G_sim × B_sim
+     scores, pick the frame with highest Y-row score density, then emit its
+     best byte per row across the score-active Y range. */
+static void extract_answer(const ContextManager* cm,
+                           uint32_t match_id,
+                           int radius,
+                           const InputSignature* q_sig,
+                           char* out, size_t cap) {
+    out[0] = '\0';
+
+    int32_t w_start = (int32_t)match_id - radius; if (w_start < 0) w_start = 0;
+    int32_t w_end   = (int32_t)match_id + radius;
+    if (w_end >= (int32_t)cm->frame_count) w_end = (int32_t)cm->frame_count - 1;
+
+    double   best_density = -1.0;
+    uint32_t best_fid = match_id;
+    uint32_t best_ys = 0, best_ye = 0;
+
+    /* Pass 1: find global max density threshold to trim low-score tails */
+    double global_max = 0.0;
+    for (int32_t fid = w_start; fid <= w_end; fid++) {
+        double per_y[GRID_SIZE];
+        frame_y_scores(cm->frames[fid].grid, q_sig, per_y);
+        for (uint32_t y = 0; y < GRID_SIZE; y++)
+            if (per_y[y] > global_max) global_max = per_y[y];
+    }
+    double threshold = global_max * 0.25;  /* keep top 75% of peak density */
+
+    for (int32_t fid = w_start; fid <= w_end; fid++) {
+        double per_y[GRID_SIZE];
+        frame_y_scores(cm->frames[fid].grid, q_sig, per_y);
+
+        /* Contiguous Y range above threshold */
+        int32_t first = -1, last = -1;
+        double total = 0;
+        int32_t active_rows = 0;
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            if (per_y[y] >= threshold) {
+                if (first < 0) first = (int32_t)y;
+                last = (int32_t)y;
+                total += per_y[y];
+                active_rows++;
+            }
+        }
+        if (first < 0 || active_rows < 2) continue;
+        double density = total / (double)active_rows;
+        if (density > best_density) {
+            best_density = density;
+            best_fid = (uint32_t)fid;
+            best_ys = (uint32_t)first;
+            best_ye = (uint32_t)last;
+        }
+    }
+
+    if (best_density <= 0.0) {
+        /* Nothing scored above threshold — decode matched frame directly. */
+        grid_decode_text(cm->frames[match_id].grid, out, (uint32_t)cap);
+        return;
+    }
+
+    decode_frame_range(cm->frames[best_fid].grid, q_sig,
+                       best_ys, best_ye, out, cap);
+}
+
+/* ── Evaluation: normalization, EM, F1 ── */
+
+/* Normalize: lowercase ASCII, keep UTF-8 bytes (≥0x80) as-is,
+   collapse non-alphanumeric into single spaces, trim. */
+static void normalize_text(const char* in, char* out, size_t cap) {
+    size_t oi = 0;
+    int in_word = 0;
+    for (size_t i = 0; in[i] && oi + 1 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            c >= 0x80) {
+            if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            out[oi++] = (char)c;
+            in_word = 1;
+        } else {
+            if (in_word) {
+                out[oi++] = ' ';
+                in_word = 0;
+            }
+        }
+    }
+    while (oi > 0 && out[oi-1] == ' ') oi--;
+    out[oi] = '\0';
+}
+
+static int compute_em(const char* pred, const char* gold) {
+    char np[2048], ng[2048];
+    normalize_text(pred, np, sizeof(np));
+    normalize_text(gold, ng, sizeof(ng));
+    if (np[0] == '\0' || ng[0] == '\0') return 0;
+    return strcmp(np, ng) == 0;
+}
+
+/* Simple split by space into up to 64 tokens */
+static int tokenize(char* s, char* tokens[], int max_tokens) {
+    int n = 0;
+    char* p = s;
+    while (*p && n < max_tokens) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        tokens[n++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p) { *p = '\0'; p++; }
+    }
+    return n;
+}
+
+/* F1 over word-level bag multiset intersection */
+static double compute_f1(const char* pred, const char* gold) {
+    char np[2048], ng[2048];
+    normalize_text(pred, np, sizeof(np));
+    normalize_text(gold, ng, sizeof(ng));
+    if (np[0] == '\0' || ng[0] == '\0') return 0.0;
+
+    char np_c[2048], ng_c[2048];
+    strncpy(np_c, np, sizeof(np_c)); np_c[sizeof(np_c) - 1] = '\0';
+    strncpy(ng_c, ng, sizeof(ng_c)); ng_c[sizeof(ng_c) - 1] = '\0';
+
+    char* pt[128]; int pn = tokenize(np_c, pt, 128);
+    char* gt[128]; int gn = tokenize(ng_c, gt, 128);
+    if (pn == 0 || gn == 0) return 0.0;
+
+    int used_g[128]; memset(used_g, 0, sizeof(used_g));
+    int overlap = 0;
+    for (int i = 0; i < pn; i++) {
+        for (int j = 0; j < gn; j++) {
+            if (!used_g[j] && strcmp(pt[i], gt[j]) == 0) {
+                used_g[j] = 1;
+                overlap++;
+                break;
+            }
+        }
+    }
+    if (overlap == 0) return 0.0;
+    double P = (double)overlap / pn;
+    double R = (double)overlap / gn;
+    return 2.0 * P * R / (P + R);
+}
+
+/* ── main ── */
 
 int main(int argc, char* argv[]) {
     utf8_console_init();
@@ -94,71 +430,101 @@ int main(int argc, char* argv[]) {
     if (bench_parse_args(argc, argv, &ba) != 0 || ba.positional_count < 1) {
         fprintf(stderr,
             "Usage: %s <qa.tsv> [max_pairs] [--save P] [--load P] [--load-only P]\n\n"
-            "  TSV format:  <question>\\t<answer>   (one pair per line)\n"
-            "  Train: 70%%, Test: 30%% (by pair order)\n"
-            "  Neighbor radius: %d frames\n\n"
+            "  TSV format:  <question>\\t<context>\\t<answer>\n"
+            "  Pipeline:    context frames + B*G*R extraction (SPEC §4 §5 §7 §9)\n\n"
             "Example:\n"
-            "  %s data/qa.tsv --save model_qa.spai\n",
-            argv[0], NEIGHBOR_RADIUS, argv[0]);
+            "  %s data/qa_en.txt\n"
+            "  %s data/qa_en.txt 500 --save model_qa.spai\n",
+            argv[0], argv[0], argv[0]);
         return 1;
     }
 
     const char* filepath = ba.positional[0];
     int max_pairs = (ba.positional_count >= 2) ? atoi(ba.positional[1]) : DEFAULT_LIMIT;
-    if (max_pairs > MAX_PAIRS) max_pairs = MAX_PAIRS;
+    if (max_pairs > MAX_QA_PAIRS) max_pairs = MAX_QA_PAIRS;
 
     FILE* fp = fopen(filepath, "r");
     if (!fp) { fprintf(stderr, "ERROR: cannot open '%s'\n", filepath); return 1; }
 
     printf("========================================\n");
     printf("  SPATIAL-PATTERN-AI  QA Benchmark\n");
-    printf("  (RGBA matching + neighbor frames)\n");
+    printf("  (context frames + B*G*R extraction)\n");
     printf("========================================\n");
-    printf("  File:             %s\n", filepath);
-    printf("  Max pairs:        %d\n", max_pairs);
-    printf("  Train ratio:      %.0f%%\n", TRAIN_RATIO * 100);
-    printf("  Neighbor radius:  ±%d frames\n", NEIGHBOR_RADIUS);
+    printf("  File:            %s\n", filepath);
+    printf("  Max pairs:       %d\n", max_pairs);
+    printf("  Train ratio:     %.0f%%\n", TRAIN_RATIO * 100);
+    printf("  Window radius:   +- %d frames\n", WINDOW_RADIUS);
     printf("----------------------------------------\n\n");
 
     morpheme_init();
 
-    /* ── [1/4] Load ── */
-    printf("[1/4] Loading QA pairs...\n");
+    /* ── [1/4] Load TSV ── */
+    printf("[1/4] Loading QA pairs and deduplicating contexts...\n");
     double t0 = now_sec();
 
-    QAPair* pairs = (QAPair*)calloc((size_t)max_pairs, sizeof(QAPair));
-    int n = 0;
+    ContextEntry* contexts = (ContextEntry*)calloc(MAX_CONTEXTS, sizeof(ContextEntry));
+    QAItem*       qa       = (QAItem*)      calloc((size_t)max_pairs, sizeof(QAItem));
+    int n_contexts = 0;
+    int n_qa       = 0;
+
     char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), fp) && n < max_pairs) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        if (parse_line(line, &pairs[n])) n++;
+    while (fgets(line, sizeof(line), fp) && n_qa < max_pairs) {
+        char *q = NULL, *c = NULL, *a = NULL;
+        if (!parse_line(line, &q, &c, &a)) continue;
+
+        int ci = find_or_add_context(contexts, &n_contexts, c);
+        free(c);  /* find_or_add copied via strdup */
+        if (ci < 0) { free(q); free(a); continue; }
+
+        qa[n_qa].ctx_idx  = ci;
+        qa[n_qa].question = q;
+        qa[n_qa].answer   = a;
+        n_qa++;
     }
     fclose(fp);
-    printf("  Loaded: %d pairs (%.2f sec)\n\n", n, now_sec() - t0);
 
-    if (n < 20) {
-        fprintf(stderr, "ERROR: need at least 20 pairs\n");
-        free(pairs);
+    printf("  QA pairs:        %d\n",   n_qa);
+    printf("  Unique contexts: %d\n\n", n_contexts);
+    printf("  (loaded in %.2f sec)\n\n", now_sec() - t0);
+
+    if (n_qa < 10 || n_contexts < 1) {
+        fprintf(stderr, "ERROR: need at least 10 QA pairs with valid contexts\n");
         return 1;
     }
 
-    int train_n = (int)(n * TRAIN_RATIO);
-    int test_n  = n - train_n;
+    /* Sample print */
+    printf("  Example:\n");
+    {
+        int i = 0;
+        char qp[80], cp[80], ap[80];
+        strncpy(qp, qa[i].question, 76); qp[76] = '\0';
+        if (strlen(qa[i].question) > 76) strcat(qp, "...");
+        strncpy(cp, contexts[qa[i].ctx_idx].text, 76); cp[76] = '\0';
+        if (strlen(contexts[qa[i].ctx_idx].text) > 76) strcat(cp, "...");
+        strncpy(ap, qa[i].answer, 76); ap[76] = '\0';
+        if (strlen(qa[i].answer) > 76) strcat(ap, "...");
+        printf("    Q: %s\n", qp);
+        printf("    C: %s\n", cp);
+        printf("    A: %s\n\n", ap);
+    }
 
-    /* ── [2/4] Train: store Q,A,Q,A,... as keyframes ── */
-    printf("[2/4] Storing %d training pairs as consecutive keyframes...\n", train_n);
+    int train_n = (int)(n_qa * TRAIN_RATIO);
+    int test_n  = n_qa - train_n;
+
+    /* ── [2/4] Train: store each unique context as consecutive frames ── */
+    printf("[2/4] Storing unique contexts as consecutive frames via context_add_frame...\n");
     t0 = now_sec();
 
-    SpatialAI* ai = NULL;
+    ContextManager* cm = context_create();
+    SpatialAI*      ai = NULL;
     uint32_t loaded_kf = 0, loaded_df = 0;
+
     if (ba.load_path) {
         SpaiStatus ls;
         ai = ai_load(ba.load_path, &ls);
         if (!ai) {
             fprintf(stderr, "  ERROR: load '%s' failed: %s\n",
                     ba.load_path, spai_status_str(ls));
-            for (int i = 0; i < n; i++) { free(pairs[i].q); free(pairs[i].a); }
-            free(pairs);
             return 1;
         }
         loaded_kf = ai->kf_count;
@@ -168,221 +534,164 @@ int main(int argc, char* argv[]) {
         ai = spatial_ai_create();
     }
 
-    FrameCache cache;
-    cache_init(&cache);
-    BucketIndex bidx;
-    bucket_index_init(&bidx);
-    for (uint32_t k = 0; k < loaded_kf; k++) {
-        bucket_index_add(&bidx, &ai->keyframes[k].grid, k);
-    }
+    if (!ba.load_only) {
+        /* Store every unique context. Some QAs in the test split will
+           share contexts already stored by training split; that's
+           acceptable — we measure answer-extraction quality, not
+           context-level leakage. */
+        uint32_t total_clauses = 0;
+        char split_buf[MAX_CLAUSES][MAX_LINE_LEN];
 
-    /* Track which keyframe id holds each pair's Q and A. */
-    uint32_t* q_kf = (uint32_t*)malloc((size_t)train_n * sizeof(uint32_t));
-    uint32_t* a_kf = (uint32_t*)malloc((size_t)train_n * sizeof(uint32_t));
-    for (int i = 0; i < train_n; i++) { q_kf[i] = UINT32_MAX; a_kf[i] = UINT32_MAX; }
-
-    if (ba.load_only) {
-        printf("  --load-only: skipping QA training\n");
-        goto qa_training_done;
-    }
-
-    for (int i = 0; i < train_n; i++) {
-        char qlabel[16], alabel[16];
-        snprintf(qlabel, sizeof(qlabel), "Q%d", i);
-        snprintf(alabel, sizeof(alabel), "A%d", i);
-
-        uint32_t q_fid = ai_store_auto(ai, pairs[i].q, qlabel);
-        if (q_fid & 0x80000000u) {
-            /* delta — fall back to parent */
-            q_fid = ai->deltas[ai->df_count - 1].parent_id;
+        for (int ci = 0; ci < n_contexts; ci++) {
+            if (contexts[ci].trained) continue;
+            uint32_t n_cl = split_clauses(contexts[ci].text, split_buf, MAX_CLAUSES);
+            if (n_cl == 0) continue;
+            contexts[ci].clause_start = cm->frame_count;
+            contexts[ci].clause_count = n_cl;
+            for (uint32_t k = 0; k < n_cl; k++) {
+                context_add_frame(cm, ai, split_buf[k], NULL);
+                total_clauses++;
+            }
+            contexts[ci].trained = 1;
+            if ((ci + 1) % 50 == 0 || ci + 1 == n_contexts) {
+                printf("\r  Contexts: %d / %d, frames: %u",
+                       ci + 1, n_contexts, cm->frame_count);
+            }
         }
-        q_kf[i] = q_fid;
-        if (q_fid < ai->kf_count) {
-            bucket_index_add(&bidx, &ai->keyframes[q_fid].grid, q_fid);
-        }
-
-        uint32_t a_fid = ai_store_auto(ai, pairs[i].a, alabel);
-        if (a_fid & 0x80000000u) {
-            a_fid = ai->deltas[ai->df_count - 1].parent_id;
-        }
-        a_kf[i] = a_fid;
-        if (a_fid < ai->kf_count) {
-            bucket_index_add(&bidx, &ai->keyframes[a_fid].grid, a_fid);
-        }
-
-        if ((i + 1) % 100 == 0 || i + 1 == train_n) {
-            printf("\r  Stored: %d / %d  (KF=%u Delta=%u)",
-                   i + 1, train_n, ai->kf_count, ai->df_count);
-        }
+        printf("\n  Stored %u context clauses in %u frames\n",
+               total_clauses, cm->frame_count);
     }
 
     double t_store = now_sec() - t0;
-    printf("\n  Done in %.2f sec\n", t_store);
+    printf("  (in %.2f sec)\n", t_store);
 
-qa_training_done:
-    /* Save model if requested */
+    /* Save if requested */
     if (ba.save_path) {
         SpaiStatus ss;
         if (ba.load_path && strcmp(ba.load_path, ba.save_path) == 0) {
             ss = ai_save_incremental(ai, ba.save_path);
-            printf("  [save] incremental → '%s' : %s  (KF %u→%u, Delta %u→%u)\n",
+            printf("  [save] incremental -> '%s' : %s (KF %u->%u, Delta %u->%u)\n",
                    ba.save_path, spai_status_str(ss),
                    loaded_kf, ai->kf_count, loaded_df, ai->df_count);
         } else {
             ss = ai_save(ai, ba.save_path);
-            printf("  [save] full → '%s' : %s  (%u KF, %u Delta)\n",
+            printf("  [save] full -> '%s' : %s (%u KF, %u Delta)\n",
                    ba.save_path, spai_status_str(ss),
                    ai->kf_count, ai->df_count);
         }
     }
     printf("\n");
 
-    /* ── [3/4] Evaluate on held-out pairs ── */
-    printf("[3/4] Evaluating on %d held-out pairs...\n", test_n);
+    /* ── [3/4] Evaluate on held-out QAs ── */
+    printf("[3/4] Evaluating %d held-out QAs (context match + B*G*R answer extraction)...\n", test_n);
     t0 = now_sec();
 
-    int retrieval_top1 = 0;
-    int retrieval_top5 = 0;
-    double answer_cos_sum = 0.0;
-    double random_cos_sum = 0.0;
-    uint32_t answered = 0;
+    SpatialGrid*  q_grid = grid_create();
+    InputSignature q_sig;
 
-    SpatialGrid* gq     = grid_create();
-    SpatialGrid* ga_true = grid_create();
+    int ctx_hits   = 0;
+    int em_hits    = 0;
+    double f1_sum  = 0.0;
+    int answered   = 0;
 
-    /* Candidate pool: matched ± NEIGHBOR_RADIUS */
-    const int pool_max = 2 * NEIGHBOR_RADIUS + 1;
-    uint32_t cand_ids[8];
-    float    cand_q_cos[8];
-    float    cand_a_cos[8];
+    /* Show a few detailed examples */
+    const int DETAIL_N = 5;
+    int detail_printed = 0;
 
     for (int t = 0; t < test_n; t++) {
         int idx = train_n + t;
+        ContextEntry* gold_ctx = &contexts[qa[idx].ctx_idx];
+        if (!gold_ctx->trained || gold_ctx->clause_count == 0) continue;
 
-        /* 1. Encode q_test and a_test via full pipeline */
-        grid_clear(gq);
-        grid_clear(ga_true);
-        layers_encode_clause(pairs[idx].q, NULL, gq);
-        layers_encode_clause(pairs[idx].a, NULL, ga_true);
-        update_rgb_directional(gq);
-        update_rgb_directional(ga_true);
+        /* 1. Encode question */
+        grid_clear(q_grid);
+        layers_encode_clause(qa[idx].question, NULL, q_grid);
+        update_rgb_directional(q_grid);
+        input_signature_compute(&q_sig, q_grid);
 
-        /* 2. Match via SPEC §9 pipeline (RGB-weighted cosine) */
+        /* 2. Match over ctx->frames */
         float match_sim;
-        uint32_t matched = match_engine(ai, gq, &bidx, NULL, &cache, &match_sim);
-        if (matched >= ai->kf_count) continue;
+        uint32_t best_fid = match_context_frame(cm, q_grid, &match_sim);
 
-        /* 3. Candidate pool = matched ± neighbors */
-        int pool_n = 0;
-        for (int d = -NEIGHBOR_RADIUS; d <= NEIGHBOR_RADIUS; d++) {
-            int id = (int)matched + d;
-            if (id < 0 || id >= (int)ai->kf_count) continue;
-            cand_ids[pool_n++] = (uint32_t)id;
-        }
-        if (pool_n == 0) continue;
+        /* 3. Context retrieval hit: best_fid in [clause_start, clause_start+count) */
+        int ctx_hit = (best_fid >= gold_ctx->clause_start &&
+                       best_fid <  gold_ctx->clause_start + gold_ctx->clause_count);
+        if (ctx_hit) ctx_hits++;
 
-        /* 4. Rank candidates by two signals (both RGBA-weighted):
-              q_cos = how well candidate answers question (question overlap)
-              a_cos = how similar candidate is to gold answer */
-        int best_rank_idx = 0;
-        float best_q_cos = -1.0f;
-        for (int j = 0; j < pool_n; j++) {
-            const SpatialGrid* kf = &ai->keyframes[cand_ids[j]].grid;
-            cand_q_cos[j] = cosine_rgb_weighted(gq, kf);
-            cand_a_cos[j] = cosine_rgb_weighted(ga_true, kf);
-            if (cand_q_cos[j] > best_q_cos) {
-                best_q_cos = cand_q_cos[j];
-                best_rank_idx = j;
-            }
-        }
+        /* 4. Extract answer via B*G*R */
+        char pred_ans[1024];
+        extract_answer(cm, best_fid, WINDOW_RADIUS, &q_sig,
+                       pred_ans, sizeof(pred_ans));
 
-        /* Top-ranked candidate's answer quality (how close it is to a_test) */
-        float top_answer_cos = cand_a_cos[best_rank_idx];
-        answer_cos_sum += top_answer_cos;
+        /* 5. EM / F1 */
+        int em = compute_em(pred_ans, qa[idx].answer);
+        double f1 = compute_f1(pred_ans, qa[idx].answer);
+        if (em) em_hits++;
+        f1_sum += f1;
         answered++;
 
-        /* Random-KF baseline for the same a_test */
-        float rand_sum = 0.0f;
-        for (int r = 0; r < 5; r++) {
-            uint32_t rk = ((uint32_t)(t * 131 + r * 17)) % ai->kf_count;
-            rand_sum += cosine_rgb_weighted(&ai->keyframes[rk].grid, ga_true);
-        }
-        random_cos_sum += (double)(rand_sum / 5.0f);
-
-        /* Retrieval hit: is the true paired answer (a_test) within our pool,
-           measured by a_cos ranking?
-           Top-1: top-ranked candidate (by q_cos) also has highest a_cos?
-           More robust: does ANY candidate in pool have a_cos > random mean? */
-        float pool_best_a_cos = -1.0f;
-        int pool_best_a_idx = 0;
-        for (int j = 0; j < pool_n; j++) {
-            if (cand_a_cos[j] > pool_best_a_cos) {
-                pool_best_a_cos = cand_a_cos[j];
-                pool_best_a_idx = j;
-            }
-        }
-        /* Retrieval@1: the top-q-ranked candidate is also the top-a candidate */
-        if (best_rank_idx == pool_best_a_idx) retrieval_top1++;
-        /* Retrieval@5: at least one of top-5-by-q has high a_cos
-                        (for pool size ≤ 5, this is always true) */
-        retrieval_top5++;
-
-        if ((t + 1) % 20 == 0 || t + 1 == test_n) {
+        if (detail_printed < DETAIL_N) {
+            char pp[120], qp[120], ap[120];
+            strncpy(qp, qa[idx].question, 116); qp[116] = '\0';
+            if (strlen(qa[idx].question) > 116) strcat(qp, "...");
+            strncpy(pp, pred_ans, 116); pp[116] = '\0';
+            if (strlen(pred_ans) > 116) strcat(pp, "...");
+            strncpy(ap, qa[idx].answer, 116); ap[116] = '\0';
+            if (strlen(qa[idx].answer) > 116) strcat(ap, "...");
+            printf("    [%d] %s\n", t, qp);
+            printf("        ctx_hit=%s  sim=%.1f%%  em=%d  f1=%.2f\n",
+                   ctx_hit ? "Y" : "N", match_sim * 100, em, f1);
+            printf("        pred: %s\n", pp);
+            printf("        gold: %s\n\n", ap);
+            detail_printed++;
+        } else if ((t + 1) % 20 == 0 || t + 1 == test_n) {
             printf("\r  Evaluated: %d / %d", t + 1, test_n);
         }
     }
+    printf("\n");
 
-    grid_destroy(gq);
-    grid_destroy(ga_true);
+    grid_destroy(q_grid);
 
     double t_eval = now_sec() - t0;
-    printf("\n  Done in %.2f sec\n\n", t_eval);
+    printf("  Done in %.2f sec (%.1f queries/sec)\n\n",
+           t_eval, (double)answered / (t_eval + 1e-9));
 
     /* ── [4/4] Report ── */
     printf("[4/4] Results\n");
     printf("========================================\n\n");
 
     printf("  SETUP\n");
-    printf("  ─────────────────────────────────────\n");
-    printf("  Total pairs:       %d\n", n);
-    printf("  Train pairs:       %d  (%d KF, %d delta)\n",
-           train_n, ai->kf_count, ai->df_count);
-    printf("  Test pairs:        %d\n", test_n);
-    printf("  Pool size:         %d  (±%d frames)\n\n",
-           pool_max, NEIGHBOR_RADIUS);
+    printf("  -------------------------------------\n");
+    printf("  Total QA pairs:          %d\n", n_qa);
+    printf("  Train pairs:             %d\n", train_n);
+    printf("  Test pairs:              %d  (answered: %d)\n", test_n, answered);
+    printf("  Unique contexts:         %d\n", n_contexts);
+    printf("  Context frames stored:   %u\n", cm->frame_count);
+    printf("  Keyframes (side-effect): %u\n\n", ai->kf_count);
 
     if (answered > 0) {
-        double avg_cos    = answer_cos_sum / answered;
-        double avg_random = random_cos_sum / answered;
-        double lift       = avg_cos - avg_random;
+        double ctx_acc = 100.0 * ctx_hits / answered;
+        double em_acc  = 100.0 * em_hits  / answered;
+        double f1_avg  = 100.0 * f1_sum   / answered;
 
-        printf("  RETRIEVAL ACCURACY (within candidate pool)\n");
-        printf("  ─────────────────────────────────────\n");
-        printf("  Top-1:             %.2f%%  (%d / %u)\n",
-               100.0 * retrieval_top1 / answered, retrieval_top1, answered);
-        printf("  (top-q candidate == top-a candidate)\n\n");
-
-        printf("  ANSWER QUALITY  (RGB-weighted cosine)\n");
-        printf("  ─────────────────────────────────────\n");
-        printf("  Top-q candidate:    %.1f%%\n", avg_cos    * 100);
-        printf("  Random-KF baseline: %.1f%%\n", avg_random * 100);
-        printf("  Lift over random:   %+.1f%%  (absolute)\n",
-               lift * 100);
-        if (avg_random > 0.001)
-            printf("  Relative lift:      %.2fx\n",
-                   avg_cos / avg_random);
-        printf("\n");
+        printf("  METRICS\n");
+        printf("  -------------------------------------\n");
+        printf("  Context Retrieval:  %.2f%%  (%d / %d)\n",
+               ctx_acc, ctx_hits, answered);
+        printf("  Answer EM:          %.2f%%  (%d / %d)\n",
+               em_acc,  em_hits,  answered);
+        printf("  Answer F1:          %.2f\n\n", f1_avg);
 
         printf("  INTERPRETATION\n");
-        printf("  ─────────────────────────────────────\n");
-        if (lift > 0.10)
-            printf("  Strong QA signal (>10%% absolute over random).\n");
-        else if (lift > 0.03)
-            printf("  Measurable QA signal.\n");
-        else if (lift > 0.0)
-            printf("  Weak signal.\n");
-        else
-            printf("  No signal (check training data quality).\n");
+        printf("  -------------------------------------\n");
+        if (ctx_acc > 80) printf("  Strong context retrieval.\n");
+        else if (ctx_acc > 40) printf("  Moderate context retrieval.\n");
+        else if (ctx_acc > 10) printf("  Weak context retrieval.\n");
+        else printf("  Poor context retrieval.\n");
+
+        if (f1_avg > 30) printf("  Useful answer extraction signal.\n");
+        else if (f1_avg > 10) printf("  Measurable F1 signal.\n");
+        else printf("  Low F1 (extraction still B*G*R, not keyword match).\n");
         printf("\n");
     }
 
@@ -390,10 +699,12 @@ qa_training_done:
     printf("  PASS\n");
     printf("========================================\n");
 
-    for (int i = 0; i < n; i++) { free(pairs[i].q); free(pairs[i].a); }
-    free(pairs);
-    free(q_kf);
-    free(a_kf);
+    /* cleanup */
+    for (int i = 0; i < n_contexts; i++) free(contexts[i].text);
+    free(contexts);
+    for (int i = 0; i < n_qa; i++) { free(qa[i].question); free(qa[i].answer); }
+    free(qa);
+    context_destroy(cm);
     spatial_ai_destroy(ai);
     return 0;
 }
