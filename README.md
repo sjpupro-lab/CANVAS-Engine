@@ -141,33 +141,59 @@ Like video codecs: I-frames (full snapshots) and P-frames (diffs only).
   │  F1  │  2.7% │100.0% │  9.1% │
   │  F2  │  0.0% │  9.1% │100.0% │
   └──────┴───────┴───────┴───────┘
+
+  F0: "귀여운 고양이가 밥을 먹는다."
+  F1: "우리는 함께 오랜 세월을 살았다."
+  F2: "오늘 아침 하늘이 밝다."
+```
+
+## Morpheme Analyzer
+
+Dictionary-based longest-match tokenizer. No external libraries required.
+
+```
+  Input                 Output
+ ─────────────────────────────────────────────────────
+  "귀여운"          →  [adjective: 귀여운]
+  "고양이가"        →  [noun: 고양이] + [particle: 가]
+  "밥을"            →  [noun: 밥]    + [particle: 을]
+  "먹는다."         →  [verb: 먹]    + [ending: 는다] + [punct: .]
+```
+
+```
+  Dictionary composition:
+  ├── Nouns       88  (animals, food, objects, nature, people, abstract)
+  ├── Verbs       39  (먹, 가, 오, 보, 하, 되, ...)
+  ├── Adjectives  20  (귀여운, 예쁜, 밝은, 아름다운, ...)
+  ├── Particles   26  (은/는/이/가/을/를/에서/으로, ...)
+  └── Endings     20  (는다/었다/았다/겠다, ...)
 ```
 
 ## Project Structure
 
 ```
 spatial_ai/
-├── include/
+├── include/              # Header files
 │   ├── spatial_grid.h        # 256×256 grid, encoding/decoding
 │   ├── spatial_layers.h      # 3-layer summation engine
 │   ├── spatial_morpheme.h    # Korean morpheme analyzer
 │   ├── spatial_keyframe.h    # Keyframe / delta / frame
 │   ├── spatial_match.h       # Cosine similarity, matching
 │   └── spatial_context.h     # Context frames, LRU cache
-├── src/
+├── src/                  # Source files
 │   ├── spatial_grid.c
 │   ├── spatial_layers.c
 │   ├── spatial_morpheme.c
 │   ├── spatial_keyframe.c
 │   ├── spatial_match.c
 │   └── spatial_context.c
-├── dict/                     # Korean dictionaries
+├── dict/                 # Korean dictionaries
 │   ├── nouns.txt
 │   ├── verbs.txt
 │   ├── adjectives.txt
 │   ├── particles.txt
 │   └── endings.txt
-├── tests/                    # 7 test suites, 34 tests
+├── tests/                # 7 test suites, 34 tests
 │   ├── test_grid.c
 │   ├── test_layers.c
 │   ├── test_morpheme.c
@@ -199,14 +225,25 @@ make clean
 
 ## Key Properties
 
-| Property | Traditional LLM | SPATIAL-PATTERN-AI |
-|----------|----------------|--------------------|
-| Encoding | token → vector → matrix | byte → pixel → 256×256 grid |
-| Parameters | fixed-size matrix | unlimited frame stack |
-| Context | bounded window (128K) | unlimited (disk-bound) |
-| Interpretability | opaque weights | visible heatmap |
-| Learning | full retrain | incremental delta |
-| Memory per frame | — | 320 KB |
+```
+                  Traditional LLM           SPATIAL-PATTERN-AI
+ ─────────────────────────────────────────────────────────────
+  Encoding       token → vector → matrix    byte → pixel → 256×256
+  Parameters     fixed-size matrix          unlimited frame stack
+  Context        bounded window (128K)      unlimited (disk-bound)
+  Interpretability opaque weights           visible heatmap
+  Learning       full retrain               incremental delta
+  Frame memory   —                          320 KB / frame
+```
+
+## Unique Properties
+
+- **Interpretability**: Open the heatmap to visually confirm what the AI is remembering
+- **Unlimited Parameters**: No upper bound — parameters grow as frames accumulate
+- **Unlimited Context**: Scales as far as disk allows
+- **Incremental Learning**: New data adds only a delta or a new frame — no full retrain
+- **Rewind / Branching**: Traverse delta chains backwards to trace the learning history
+- **Lightweight**: 320 KB per frame; engine core is a few MB — runs on Termux and embedded systems
 
 ## License
 
