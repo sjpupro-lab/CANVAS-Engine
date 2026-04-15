@@ -92,8 +92,15 @@ double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
  * For each row y in sequence, take the byte x with the highest A
  * value (argmax across the row) as that position's byte.
  * Stops at the first empty row (all A == 0) or when out is full.
- * Returns bytes written. */
+ * Returns bytes written. Byte-level; no UTF-8 awareness. */
 uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out);
+
+/* UTF-8-aware variant used by ai_generate_next. Reads the row-argmax
+ * lead byte, then validates that the next utf8_lead_len(lead) - 1
+ * rows carry continuation bytes (10xxxxxx) before emitting the
+ * complete codepoint. Falls back to single-byte emit when validation
+ * fails, so ASCII-only output matches grid_decode_text exactly. */
+uint32_t grid_decode_text_utf8(const SpatialGrid* g, char* out, uint32_t max_out);
 
 /* ── Full-clause generation ──────────────────────────────
  * SPEC §11.3:  "매칭된 키프레임의 다음 프레임이 곧 응답 텍스트의 패턴이다."

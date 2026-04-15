@@ -198,20 +198,19 @@ double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
 
 /* ── Grid → text decoding ───────────────────────────────
  *
- * Reads row by row, argmax-A per row = most likely byte at that
- * position. Bytes are UTF-8, so we validate each decoded byte:
+ * Two variants live side by side:
  *
- *   - ASCII (0xxxxxxx):   emit, advance 1 row
- *   - 2-byte lead (110xxxxx): expect 1 continuation byte on the next row
- *   - 3-byte lead (1110xxxx): expect 2 continuations (Korean sits here)
- *   - 4-byte lead (11110xxx): expect 3 continuations
- *   - continuation (10xxxxxx): if we see this out of place, or the
- *     required number of continuations don't appear at the next rows,
- *     fall back to the raw best-x (legacy behavior) to preserve
- *     round-trip for training data where the grid was already valid.
+ *   grid_decode_text       pure row-argmax (legacy). Fast, byte-level,
+ *                          no UTF-8 awareness. Kept for callers that
+ *                          feed ASCII or don't care about multi-byte
+ *                          integrity (e.g. bench_qa byte snapshots).
  *
- * This keeps ASCII-only output identical to the old byte-argmax path
- * and stops obvious multi-byte clipping on Korean clauses.
+ *   grid_decode_text_utf8  UTF-8 aware. Validates lead + continuation
+ *                          bytes across consecutive rows so Korean and
+ *                          other multi-byte output doesn't clip. Used
+ *                          by ai_generate_next.
+ *
+ * Both read row-by-row and stop at the first empty row.
  */
 
 static int utf8_lead_len(uint8_t b) {
@@ -246,7 +245,34 @@ static void row_top_n(const SpatialGrid* g, uint32_t y,
     }
 }
 
+/* Legacy: row-argmax, one byte per row, no UTF-8 validation. */
 uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out) {
+    if (!g || !out || max_out == 0) return 0;
+
+    uint32_t written = 0;
+    for (uint32_t y = 0; y < GRID_SIZE && written + 1 < max_out; y++) {
+        uint32_t best_x = 0;
+        uint16_t best_a = 0;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (g->A[i] > best_a) {
+                best_a = g->A[i];
+                best_x = x;
+            }
+        }
+        if (best_a == 0) break;
+        out[written++] = (char)(uint8_t)best_x;
+    }
+    out[written] = '\0';
+    return written;
+}
+
+/* UTF-8 aware: row-argmax for the lead byte, then consume
+ * `utf8_lead_len(lead) - 1` continuation bytes from the following
+ * rows. If the required continuations aren't present in the top
+ * candidates, fall back to a single-byte emit so ASCII still round-
+ * trips and garbled cells don't stall the decoder. */
+uint32_t grid_decode_text_utf8(const SpatialGrid* g, char* out, uint32_t max_out) {
     if (!g || !out || max_out == 0) return 0;
 
     uint32_t written = 0;
@@ -350,17 +376,21 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     }
 
     /* 1. Encode input through full pipeline */
-    morpheme_init();
     SpatialGrid* in_grid = grid_create();
     layers_encode_clause(input_text, NULL, in_grid);
     update_rgb_directional(in_grid);
     apply_ema_to_grid(ai, in_grid);
 
-    /* 2. Unified match (carries the engine-owned bucket index) */
+    /* 2. Unified match in GENERATE mode (bg_score precision stage).
+     *    With the B channel now POS-seeded (spec v2 Mod D), MATCH_GENERATE
+     *    favors candidates whose B × G pattern matches the query, which
+     *    is a better proxy for "what should come next" than a pure
+     *    cosine. The engine's bucket index is passed through so
+     *    large-corpus retrieval stays fast. */
     MatchContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.bucket_idx = &ai->bucket_idx;
-    MatchResult r = spatial_match(ai, in_grid, MATCH_PREDICT, &ctx);
+    MatchResult r = spatial_match(ai, in_grid, MATCH_GENERATE, &ctx);
     grid_destroy(in_grid);
 
     if (out_match_similarity) *out_match_similarity = r.best_score;
@@ -374,6 +404,6 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
      *    otherwise sequential (legacy). */
     uint32_t target_id = find_next_in_topic(ai, r.best_id);
 
-    /* 4. Decode target frame's grid → text (UTF-8 aware, Mod 8). */
-    return grid_decode_text(&ai->keyframes[target_id].grid, out, max_out);
+    /* 4. Decode target frame's grid → text (UTF-8 aware). */
+    return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
 }

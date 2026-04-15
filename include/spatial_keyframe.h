@@ -76,6 +76,12 @@ typedef struct SpatialAI_ {
      * Managed entirely in-memory; not serialized — rebuilt on load. */
     BucketIndex bucket_idx;
 
+    /* Morpheme-dictionary readiness flag. Set by spatial_ai_create; all
+     * hot paths (ai_store_auto / ai_predict / ai_generate_next /
+     * ai_force_keyframe) assume this is already true and skip the
+     * morpheme_init() call. */
+    int morpheme_ready;
+
     /* RGB EMA tables indexed by (y * 256 + x). Accumulated across
      * every stored clause so R/G/B values stabilize at each bitmap
      * position as training progresses. ema_count is the running

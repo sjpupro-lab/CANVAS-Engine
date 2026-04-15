@@ -455,73 +455,25 @@ MatchResult spatial_match(SpatialAI* ai,
     return result;
 }
 
-/* ── Cascade Step 1 delegates to spatial_match(MATCH_SEARCH) ── */
 
-static uint32_t cascade_step1_best(SpatialAI* ai, SpatialGrid* input,
-                                   float* out_a_sim) {
-    MatchResult r = spatial_match(ai, input, MATCH_SEARCH, NULL);
-    if (out_a_sim) *out_a_sim = (r.best_score < 0.0f) ? 0.0f : r.best_score;
-    return r.best_id;
-}
-
-/* ── Public: match_cascade ─────────────────────────────── */
-
+/* ── Public: match_cascade (thin wrapper, spec v2) ──
+ *
+ * The old 3-stage cascade (A-only early return → channel-pair rerank
+ * → cross-pair rematch) has been replaced with the unified 2-stage
+ * spatial_match core. The CascadeMode values map directly to the new
+ * MatchMode enum; callers keep their existing API. */
 uint32_t match_cascade(SpatialAI* ai, SpatialGrid* input,
                        CascadeMode mode, float* out_similarity) {
-    if (!ai || !input || ai->kf_count == 0) {
-        if (out_similarity) *out_similarity = 0.0f;
-        return 0;
+    MatchMode mm;
+    switch (mode) {
+        case CASCADE_SEARCH:   mm = MATCH_SEARCH;   break;
+        case CASCADE_QA:       mm = MATCH_QA;       break;
+        case CASCADE_GENERATE: mm = MATCH_GENERATE; break;
+        default:               mm = MATCH_PREDICT;  break;
     }
-
-    /* All modes begin with Step 1: A-only match */
-    float a_sim = 0.0f;
-    uint32_t a_best = cascade_step1_best(ai, input, &a_sim);
-
-    if (mode == CASCADE_SEARCH) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
-    }
-
-    /* Early return if A match is strong (structurally identical clause) */
-    if (a_sim >= CASCADE_STEP1_THRESHOLD) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
-    }
-
-    /* Step 2: channel-pair scoring over ALL keyframes */
-    uint32_t n = ai->kf_count;
-    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
-    }
-
-    for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
-        pool[i].score = (mode == CASCADE_QA)
-            ? rg_score(input, &ai->keyframes[i].grid)
-            : bg_score(input, &ai->keyframes[i].grid);
-    }
-    uint32_t k = (TOP_K < n) ? TOP_K : n;
-    topk_select(pool, n, k);
-
-    /* Step 3: rematch top-K with the OTHER channel pair */
-    uint32_t final_id = pool[0].id;
-    float    final_score = -1.0f;
-    for (uint32_t i = 0; i < k; i++) {
-        float s = (mode == CASCADE_QA)
-            ? ba_score(input, &ai->keyframes[pool[i].id].grid)
-            : ra_score(input, &ai->keyframes[pool[i].id].grid);
-        if (s > final_score) { final_score = s; final_id = pool[i].id; }
-    }
-
-    free(pool);
-
-    if (out_similarity) {
-        /* Normalize: report RGB-weighted cosine for consistency */
-        *out_similarity = cosine_rgb_weighted(input, &ai->keyframes[final_id].grid);
-    }
-    return final_id;
+    MatchResult r = spatial_match(ai, input, mm, NULL);
+    if (out_similarity) *out_similarity = r.best_score;
+    return r.best_id;
 }
 
 /* ── Public: match_cascade_topk ────────────────────────── */
@@ -636,6 +588,11 @@ float adaptive_score(const SpatialGrid* a, const SpatialGrid* b,
 
 /* ── Weighted cascade variants ────────────────────────── */
 
+/* Weighted variants: top-K from adaptive_score over the whole engine.
+ * Skipping the unified spatial_match cascade here because the adaptive
+ * scoring rule combines all four channels uniformly and needs every
+ * keyframe scored once — no coarse filter is cheaper than just running
+ * the scorer. */
 uint32_t match_cascade_weighted(SpatialAI* ai, SpatialGrid* input,
                                 CascadeMode mode, const ChannelWeight* w,
                                 float* out_similarity) {
@@ -644,38 +601,23 @@ uint32_t match_cascade_weighted(SpatialAI* ai, SpatialGrid* input,
         if (out_similarity) *out_similarity = 0.0f;
         return 0;
     }
+    (void)mode; /* adaptive score is mode-agnostic */
 
-    /* Step 1: A-only cascade step, same as match_cascade */
-    float a_sim = 0.0f;
-    uint32_t a_best = cascade_step1_best(ai, input, &a_sim);
-
-    if (mode == CASCADE_SEARCH) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
-    }
-    if (a_sim >= CASCADE_STEP1_THRESHOLD) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
-    }
-
-    /* Step 2/3: use adaptive_score directly. The weighted score
-       combines all four channels; cascade mode affects which
-       candidates we re-rank but scoring is uniform. */
     uint32_t n = ai->kf_count;
     Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
     if (!pool) {
-        if (out_similarity) *out_similarity = a_sim;
-        return a_best;
+        if (out_similarity) *out_similarity = 0.0f;
+        return 0;
     }
     for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
+        pool[i].id    = i;
         pool[i].score = adaptive_score(input, &ai->keyframes[i].grid, w);
     }
     uint32_t k = (TOP_K < n) ? TOP_K : n;
     topk_select(pool, n, k);
 
     uint32_t final_id = pool[0].id;
-    float final_score = pool[0].score;
+    float    final_score = pool[0].score;
     free(pool);
 
     if (out_similarity) *out_similarity = final_score;
@@ -688,15 +630,14 @@ uint32_t match_cascade_topk_weighted(SpatialAI* ai, SpatialGrid* input,
                                      float* out_scores) {
     if (!w) return match_cascade_topk(ai, input, mode, k, out_ids, out_scores);
     if (!ai || !input || !out_ids || !out_scores || ai->kf_count == 0 || k == 0) return 0;
-
-    (void)mode;  /* adaptive top-K ignores mode — it re-ranks by adaptive_score */
+    (void)mode;
 
     uint32_t n = ai->kf_count;
     if (k > n) k = n;
     Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
     if (!pool) return 0;
     for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
+        pool[i].id    = i;
         pool[i].score = adaptive_score(input, &ai->keyframes[i].grid, w);
     }
     topk_select(pool, n, k);
@@ -708,6 +649,7 @@ uint32_t match_cascade_topk_weighted(SpatialAI* ai, SpatialGrid* input,
     return k;
 }
 
+/* match_cascade_topk becomes a thin spatial_match wrapper (spec v2). */
 uint32_t match_cascade_topk(SpatialAI* ai, SpatialGrid* input,
                             CascadeMode mode, uint32_t k,
                             uint32_t* out_ids, float* out_scores) {
@@ -715,57 +657,19 @@ uint32_t match_cascade_topk(SpatialAI* ai, SpatialGrid* input,
         return 0;
     }
 
-    uint32_t n = ai->kf_count;
-    if (k > n) k = n;
-
-    /* Special case: CASCADE_SEARCH returns top-K by A-only cosine */
-    if (mode == CASCADE_SEARCH) {
-        Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-        if (!pool) return 0;
-        for (uint32_t i = 0; i < n; i++) {
-            pool[i].id = i;
-            pool[i].score = cosine_a_only(input, &ai->keyframes[i].grid);
-        }
-        topk_select(pool, n, k);
-        for (uint32_t i = 0; i < k; i++) {
-            out_ids[i]    = pool[i].id;
-            out_scores[i] = pool[i].score;
-        }
-        free(pool);
-        return k;
+    MatchMode mm;
+    switch (mode) {
+        case CASCADE_SEARCH:   mm = MATCH_SEARCH;   break;
+        case CASCADE_QA:       mm = MATCH_QA;       break;
+        case CASCADE_GENERATE: mm = MATCH_GENERATE; break;
+        default:               mm = MATCH_PREDICT;  break;
     }
-
-    /* Step 2: channel-pair top candidates */
-    Candidate* pool2 = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool2) return 0;
+    MatchResult r = spatial_match(ai, input, mm, NULL);
+    uint32_t n = r.topk_count < k ? r.topk_count : k;
     for (uint32_t i = 0; i < n; i++) {
-        pool2[i].id = i;
-        pool2[i].score = (mode == CASCADE_QA)
-            ? rg_score(input, &ai->keyframes[i].grid)
-            : bg_score(input, &ai->keyframes[i].grid);
+        out_ids[i]    = r.topk[i].id;
+        out_scores[i] = r.topk[i].score;
     }
-    /* Keep a larger pool for re-ranking (TOP_K or k*3, whichever is larger) */
-    uint32_t K2 = (k * 3 > TOP_K) ? k * 3 : TOP_K;
-    if (K2 > n) K2 = n;
-    topk_select(pool2, n, K2);
-
-    /* Step 3: rematch the K2 candidates with the OTHER channel pair */
-    Candidate* pool3 = (Candidate*)malloc(K2 * sizeof(Candidate));
-    if (!pool3) { free(pool2); return 0; }
-    for (uint32_t i = 0; i < K2; i++) {
-        pool3[i].id = pool2[i].id;
-        pool3[i].score = (mode == CASCADE_QA)
-            ? ba_score(input, &ai->keyframes[pool2[i].id].grid)
-            : ra_score(input, &ai->keyframes[pool2[i].id].grid);
-    }
-    topk_select(pool3, K2, k);
-
-    for (uint32_t i = 0; i < k; i++) {
-        out_ids[i]    = pool3[i].id;
-        out_scores[i] = pool3[i].score;
-    }
-
-    free(pool2);
-    free(pool3);
-    return k;
+    return n;
 }
+

@@ -133,6 +133,11 @@ SpatialAI* spatial_ai_create(void) {
      * keyframes are added. Rebuilt in ai_load after reading KFs. */
     bucket_index_init(&ai->bucket_idx);
 
+    /* Morpheme dictionary is embedded, but we still pay the per-engine
+     * init cost up-front so hot paths can skip it. */
+    morpheme_init();
+    ai->morpheme_ready = 1;
+
     /* EMA tables start at zero (no evidence yet). */
     memset(ai->ema_R,     0, sizeof(ai->ema_R));
     memset(ai->ema_G,     0, sizeof(ai->ema_G));
@@ -303,7 +308,6 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
     SpatialGrid* input = grid_create();
     if (!input) return UINT32_MAX;
 
-    morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
     apply_ema_to_grid(ai, input);
@@ -431,7 +435,6 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     SpatialGrid* input = grid_create();
     if (!input) return UINT32_MAX;
 
-    morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
     apply_ema_to_grid(ai, input);
@@ -467,7 +470,6 @@ uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity
         return UINT32_MAX;
     }
 
-    morpheme_init();
     layers_encode_clause(input_text, NULL, input);
     update_rgb_directional(input);
     apply_ema_to_grid(ai, input);
