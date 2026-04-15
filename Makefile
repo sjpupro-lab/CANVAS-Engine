@@ -121,6 +121,15 @@ gpu_train_help:
 $(BUILD_DIR)/stream_train: tools/stream_train.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+# ─── Interactive chat REPL ───────────────────────────────────────
+$(BUILD_DIR)/chat: tools/chat.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+chat: $(BUILD_DIR)/chat
+	@echo "Built chat. Example:"
+	@echo "  ./build/chat --load build/models/wiki5k.spai"
+	@echo "  ./build/chat --train data/wiki5k.txt --max 5000"
+
 stream: $(BUILD_DIR)/stream_train
 	@echo "Built stream_train. Example:"
 	@echo "  ./build/stream_train --input data/sample_en.txt --max 50000 \\"
