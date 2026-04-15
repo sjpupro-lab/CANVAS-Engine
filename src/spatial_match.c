@@ -313,11 +313,21 @@ void bucket_candidates(BucketIndex* idx, uint32_t hash, int expand,
     }
 }
 
-/* ── Channel-pair scoring primitives ─────────────────────── */
+/* ── Channel-pair scoring primitives ───────────────────────
+ *
+ * All four helpers return a mean in [0, 1] over the co-active cells
+ * (A[i] > 0 on both grids). The previous implementation returned a
+ * raw Σ, which scaled with the number of co-active cells and yielded
+ * values like 28.0 / 42.0 when fed through cascade modes — breaking
+ * threshold comparisons against cosine scores (which are already
+ * normalized). ba_score / ra_score additionally switch from a raw
+ * min(A_a, A_b) to a min/max ratio so the A-channel contribution is
+ * also bounded to [0, 1]. */
 
 float rg_score(const SpatialGrid* a, const SpatialGrid* b) {
     if (!a || !b) return 0.0f;
     double s = 0.0;
+    uint32_t n = 0;
     for (uint32_t i = 0; i < GRID_TOTAL; i++) {
         if (a->A[i] == 0 || b->A[i] == 0) continue;
         double r_sim = 1.0 - fabs((double)a->R[i] - b->R[i]) / 255.0;
@@ -325,13 +335,16 @@ float rg_score(const SpatialGrid* a, const SpatialGrid* b) {
         if (r_sim < 0) r_sim = 0;
         if (g_sim < 0) g_sim = 0;
         s += r_sim * g_sim;
+        n++;
     }
-    return (float)s;
+    if (n == 0) return 0.0f;
+    return (float)(s / (double)n);
 }
 
 float bg_score(const SpatialGrid* a, const SpatialGrid* b) {
     if (!a || !b) return 0.0f;
     double s = 0.0;
+    uint32_t n = 0;
     for (uint32_t i = 0; i < GRID_TOTAL; i++) {
         if (a->A[i] == 0 || b->A[i] == 0) continue;
         double b_sim = 1.0 - fabs((double)a->B[i] - b->B[i]) / 255.0;
@@ -339,34 +352,46 @@ float bg_score(const SpatialGrid* a, const SpatialGrid* b) {
         if (b_sim < 0) b_sim = 0;
         if (g_sim < 0) g_sim = 0;
         s += b_sim * g_sim;
+        n++;
     }
-    return (float)s;
+    if (n == 0) return 0.0f;
+    return (float)(s / (double)n);
 }
 
 float ba_score(const SpatialGrid* a, const SpatialGrid* b) {
     if (!a || !b) return 0.0f;
     double s = 0.0;
+    uint32_t n = 0;
     for (uint32_t i = 0; i < GRID_TOTAL; i++) {
         if (a->A[i] == 0 || b->A[i] == 0) continue;
         double b_sim = 1.0 - fabs((double)a->B[i] - b->B[i]) / 255.0;
-        uint16_t mn = (a->A[i] < b->A[i]) ? a->A[i] : b->A[i];
+        double a_min = (double)((a->A[i] < b->A[i]) ? a->A[i] : b->A[i]);
+        double a_max = (double)((a->A[i] > b->A[i]) ? a->A[i] : b->A[i]);
+        double a_sim = (a_max > 0.0) ? (a_min / a_max) : 0.0;
         if (b_sim < 0) b_sim = 0;
-        s += b_sim * (double)mn;
+        s += b_sim * a_sim;
+        n++;
     }
-    return (float)s;
+    if (n == 0) return 0.0f;
+    return (float)(s / (double)n);
 }
 
 float ra_score(const SpatialGrid* a, const SpatialGrid* b) {
     if (!a || !b) return 0.0f;
     double s = 0.0;
+    uint32_t n = 0;
     for (uint32_t i = 0; i < GRID_TOTAL; i++) {
         if (a->A[i] == 0 || b->A[i] == 0) continue;
         double r_sim = 1.0 - fabs((double)a->R[i] - b->R[i]) / 255.0;
-        uint16_t mn = (a->A[i] < b->A[i]) ? a->A[i] : b->A[i];
+        double a_min = (double)((a->A[i] < b->A[i]) ? a->A[i] : b->A[i]);
+        double a_max = (double)((a->A[i] > b->A[i]) ? a->A[i] : b->A[i]);
+        double a_sim = (a_max > 0.0) ? (a_min / a_max) : 0.0;
         if (r_sim < 0) r_sim = 0;
-        s += r_sim * (double)mn;
+        s += r_sim * a_sim;
+        n++;
     }
-    return (float)s;
+    if (n == 0) return 0.0f;
+    return (float)(s / (double)n);
 }
 
 /* ── Unified matching entry point (Mod 1) ───────────────── */
