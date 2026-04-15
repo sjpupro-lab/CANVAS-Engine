@@ -6,6 +6,180 @@
 
 #define INITIAL_CAPACITY 64
 #define SIMILARITY_THRESHOLD 0.3f
+#define EMA_ALPHA            0.1f   /* new value weight per update */
+#define EMA_MIN_EVIDENCE     2.0f   /* skip cells with fewer observations */
+
+/* Runtime-overridable store threshold. Set by ai_set_store_threshold().
+ * On real wiki clauses the default 0.30 rarely triggers — see the
+ * practical test in tools/run_practical_test.sh — so callers (e.g.
+ * stream_train --threshold 0.15) can lower it for delta-heavy runs. */
+static float g_store_threshold = SIMILARITY_THRESHOLD;
+
+void ai_set_store_threshold(float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    g_store_threshold = t;
+}
+
+float ai_get_store_threshold(void) { return g_store_threshold; }
+
+/* ── Topic hashing ──
+ *
+ * Keyframes carry a topic_hash + seq_in_topic. The hash groups
+ * clauses that likely belong to the same document so ai_store_auto
+ * can skip the O(KF) flat scan and only compare the new clause
+ * against same-topic keyframes. When enough same-topic clauses
+ * cluster, deltas trigger instead of exploding the keyframe count.
+ *
+ * Derivation precedence:
+ *   1. non-empty label: djb2(label) — explicit document tag
+ *   2. else:            djb2(first space-delimited token of clause)
+ *   3. else:            0 (legacy sequential behavior)
+ *
+ * Using only the first token is intentional: wiki abstracts often
+ * lead every clause with the article subject ("Anarchism is ...",
+ * "Anarchism advocates ..."), so a 1-token fingerprint clusters
+ * them cheaply without the cost of a full doc classifier. */
+static uint32_t djb2_bytes(const unsigned char* p, size_t n) {
+    uint32_t h = 5381u;
+    for (size_t i = 0; i < n; i++) h = h * 33u + (uint32_t)p[i];
+    return h;
+}
+
+static uint32_t topic_hash_from_text(const char* text) {
+    if (!text) return 0;
+    const unsigned char* p = (const unsigned char*)text;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const unsigned char* start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+           *p != '.' && *p != ',' && *p != '!' && *p != '?') p++;
+    size_t n = (size_t)(p - start);
+    if (n == 0) return 0;
+    uint32_t h = djb2_bytes(start, n);
+    return h ? h : 1;
+}
+
+static uint32_t topic_hash_from_label(const char* label) {
+    if (!label || !*label) return 0;
+    uint32_t h = djb2_bytes((const unsigned char*)label, strlen(label));
+    return h ? h : 1;
+}
+
+/* Resolve the topic for a store call: label wins if provided, else the
+ * clause's first token. Returns 0 only when neither yields any bytes,
+ * which we treat as "no topic" (legacy flat-scan fallback). */
+uint32_t ai_resolve_topic(const char* clause_text, const char* label) {
+    uint32_t h = topic_hash_from_label(label);
+    if (h == 0) h = topic_hash_from_text(clause_text);
+    return h;
+}
+
+static uint32_t resolve_topic(const char* clause_text, const char* label) {
+    return ai_resolve_topic(clause_text, label);
+}
+
+static uint32_t next_seq_in_topic(const SpatialAI* ai, uint32_t topic) {
+    if (topic == 0) return 0;
+    uint32_t max_seq = 0;
+    int seen = 0;
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (ai->keyframes[i].topic_hash == topic) {
+            if (!seen || ai->keyframes[i].seq_in_topic > max_seq) {
+                max_seq = ai->keyframes[i].seq_in_topic;
+            }
+            seen = 1;
+        }
+    }
+    return seen ? max_seq + 1 : 1;
+}
+
+/* Scan only keyframes carrying `topic` and return the best
+ * cosine_a_only match. Returns UINT32_MAX (no candidates) when no
+ * keyframe shares this topic. */
+static uint32_t topic_bucket_best_match(const SpatialAI* ai,
+                                        const SpatialGrid* input,
+                                        uint32_t topic,
+                                        float* out_sim) {
+    float best = -1.0f;
+    uint32_t best_id = UINT32_MAX;
+    if (topic != 0) {
+        for (uint32_t i = 0; i < ai->kf_count; i++) {
+            if (ai->keyframes[i].topic_hash != topic) continue;
+            float sim = cosine_a_only(input, &ai->keyframes[i].grid);
+            if (sim > best) { best = sim; best_id = i; }
+        }
+    }
+    if (out_sim) *out_sim = (best < 0.0f) ? 0.0f : best;
+    return best_id;
+}
+
+/* ── RGB EMA ──
+ *
+ * apply_ema_to_grid blends the accumulated EMA means into an input
+ * grid's R/G/B wherever the EMA has enough evidence. The intent is to
+ * stabilize each (y, x) cell's channel values across a large corpus:
+ * individual clauses are noisy, but the mean over thousands of
+ * clauses converges to the POS / context prior for that bitmap slot.
+ *
+ * ema_update walks the active cells of a freshly stored grid and
+ * folds their R/G/B into the running means with weight EMA_ALPHA. A
+ * companion count table lets apply_ema_to_grid know how many
+ * observations back each cell; cells below EMA_MIN_EVIDENCE are left
+ * alone. The update is commutative and doesn't depend on the order
+ * in which clauses are stored.
+ */
+
+void apply_ema_to_grid(const SpatialAI* ai, SpatialGrid* grid) {
+    if (!ai || !grid) return;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (grid->A[i] == 0) continue;
+        if (ai->ema_count[i] < EMA_MIN_EVIDENCE) continue;
+
+        float er = ai->ema_R[i];
+        float eg = ai->ema_G[i];
+        float eb = ai->ema_B[i];
+
+        /* Cells that came out of the encoder with no POS seed get
+         * overwritten; cells with a seed are blended 50/50 so the
+         * local signal still matters. */
+        if (grid->R[i] == 0 && grid->G[i] == 0 && grid->B[i] == 0) {
+            grid->R[i] = (uint8_t)(er > 255.0f ? 255 : (er < 0.0f ? 0 : er));
+            grid->G[i] = (uint8_t)(eg > 255.0f ? 255 : (eg < 0.0f ? 0 : eg));
+            grid->B[i] = (uint8_t)(eb > 255.0f ? 255 : (eb < 0.0f ? 0 : eb));
+        } else {
+            float r = 0.5f * (float)grid->R[i] + 0.5f * er;
+            float g = 0.5f * (float)grid->G[i] + 0.5f * eg;
+            float b = 0.5f * (float)grid->B[i] + 0.5f * eb;
+            if (r > 255.0f) r = 255.0f; if (r < 0.0f) r = 0.0f;
+            if (g > 255.0f) g = 255.0f; if (g < 0.0f) g = 0.0f;
+            if (b > 255.0f) b = 255.0f; if (b < 0.0f) b = 0.0f;
+            grid->R[i] = (uint8_t)r;
+            grid->G[i] = (uint8_t)g;
+            grid->B[i] = (uint8_t)b;
+        }
+    }
+}
+
+void ema_update(SpatialAI* ai, const SpatialGrid* grid) {
+    if (!ai || !grid) return;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (grid->A[i] == 0) continue;
+        float r = (float)grid->R[i];
+        float g = (float)grid->G[i];
+        float b = (float)grid->B[i];
+
+        if (ai->ema_count[i] == 0.0f) {
+            ai->ema_R[i] = r;
+            ai->ema_G[i] = g;
+            ai->ema_B[i] = b;
+        } else {
+            ai->ema_R[i] = (1.0f - EMA_ALPHA) * ai->ema_R[i] + EMA_ALPHA * r;
+            ai->ema_G[i] = (1.0f - EMA_ALPHA) * ai->ema_G[i] + EMA_ALPHA * g;
+            ai->ema_B[i] = (1.0f - EMA_ALPHA) * ai->ema_B[i] + EMA_ALPHA * b;
+        }
+        ai->ema_count[i] += 1.0f;
+    }
+}
 
 SpatialAI* spatial_ai_create(void) {
     SpatialAI* ai = (SpatialAI*)malloc(sizeof(SpatialAI));
@@ -24,6 +198,21 @@ SpatialAI* spatial_ai_create(void) {
 
     /* Canvas pool is lazily created on first ai_get_canvas_pool() call */
     ai->canvas_pool = NULL;
+
+    /* Hash bucket index for large-corpus retrieval; populated as
+     * keyframes are added. Rebuilt in ai_load after reading KFs. */
+    bucket_index_init(&ai->bucket_idx);
+
+    /* Morpheme dictionary is embedded, but we still pay the per-engine
+     * init cost up-front so hot paths can skip it. */
+    morpheme_init();
+    ai->morpheme_ready = 1;
+
+    /* EMA tables start at zero (no evidence yet). */
+    memset(ai->ema_R,     0, sizeof(ai->ema_R));
+    memset(ai->ema_G,     0, sizeof(ai->ema_G));
+    memset(ai->ema_B,     0, sizeof(ai->ema_B));
+    memset(ai->ema_count, 0, sizeof(ai->ema_count));
 
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
@@ -63,6 +252,8 @@ void spatial_ai_destroy(SpatialAI* ai) {
         pool_destroy(ai->canvas_pool);
         ai->canvas_pool = NULL;
     }
+
+    bucket_index_destroy(&ai->bucket_idx);
 
     free(ai);
 }
@@ -134,12 +325,14 @@ uint32_t compute_delta(const SpatialGrid* base, const SpatialGrid* target,
         int16_t dA = (int16_t)target->A[i] - (int16_t)base->A[i];
         int8_t  dR = (int8_t)((int)target->R[i] - (int)base->R[i]);
         int8_t  dG = (int8_t)((int)target->G[i] - (int)base->G[i]);
+        int8_t  dB = (int8_t)((int)target->B[i] - (int)base->B[i]);
 
-        if (dA != 0 || dR != 0 || dG != 0) {
-            entries[count].index = i;
+        if (dA != 0 || dR != 0 || dG != 0 || dB != 0) {
+            entries[count].index  = i;
             entries[count].diff_A = dA;
             entries[count].diff_R = dR;
             entries[count].diff_G = dG;
+            entries[count].diff_B = dB;
             count++;
         }
     }
@@ -170,6 +363,11 @@ void apply_delta(const SpatialGrid* base, const DeltaEntry* entries,
         if (val_G < 0) val_G = 0;
         if (val_G > 255) val_G = 255;
         out->G[idx] = (uint8_t)val_G;
+
+        int val_B = (int)out->B[idx] + entries[i].diff_B;
+        if (val_B < 0) val_B = 0;
+        if (val_B > 255) val_B = 255;
+        out->B[idx] = (uint8_t)val_B;
     }
 }
 
@@ -180,9 +378,11 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
     SpatialGrid* input = grid_create();
     if (!input) return UINT32_MAX;
 
-    morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
+
+    uint32_t topic = resolve_topic(clause_text, label);
 
     /* If no keyframes yet, store as first keyframe */
     if (ai->kf_count == 0) {
@@ -193,26 +393,45 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = topic ? 1 : 0;
         keyframe_alloc_grid(kf, input);
 
         ai->kf_count = 1;
+        bucket_index_add(&ai->bucket_idx, input, 0);
+        ema_update(ai, input);
         grid_destroy(input);
         return 0;
     }
 
-    /* Find best matching keyframe */
-    float best_sim = -1.0f;
-    uint32_t best_id = 0;
+    /* Matching strategy (spec v3 — topic-bucketed):
+     *   1. If the clause has a topic, first walk only same-topic
+     *      keyframes. Same-topic clauses typically share a lot of
+     *      byte-position overlap (wiki abstracts often lead with
+     *      the article subject) so this small linear scan finds
+     *      deltas the flat scan missed.
+     *   2. Fall back to the unified spatial_match(MATCH_SEARCH)
+     *      cascade if the topic bucket is empty OR the best
+     *      same-topic sim failed to clear the threshold. The
+     *      cascade respects the bucket index when kf_count is
+     *      large. */
+    float    best_sim = 0.0f;
+    uint32_t best_id  = UINT32_MAX;
+    uint32_t bucket_best = topic_bucket_best_match(ai, input, topic, &best_sim);
+    if (bucket_best != UINT32_MAX) best_id = bucket_best;
 
-    for (uint32_t i = 0; i < ai->kf_count; i++) {
-        float sim = cosine_a_only(input, &ai->keyframes[i].grid);
-        if (sim > best_sim) {
-            best_sim = sim;
-            best_id = i;
+    if (best_sim < g_store_threshold) {
+        MatchContext ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.bucket_idx = &ai->bucket_idx;
+        MatchResult mr = spatial_match(ai, input, MATCH_SEARCH, &ctx);
+        if (mr.best_score > best_sim) {
+            best_sim = mr.best_score;
+            best_id  = mr.best_id;
         }
     }
 
-    if (best_sim >= SIMILARITY_THRESHOLD) {
+    if (best_sim >= g_store_threshold && best_id < ai->kf_count) {
         /* Store as delta frame */
         if (!ensure_df_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
 
@@ -259,6 +478,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         }
 
         ai->df_count++;
+        ema_update(ai, input);
         grid_destroy(input);
         return df->id | 0x80000000u; /* high bit indicates delta */
     } else {
@@ -271,6 +491,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = next_seq_in_topic(ai, topic);
         keyframe_alloc_grid(kf, input);
 
         /* Adaptive feedback for "novel" input: compare against the
@@ -288,6 +510,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         }
 
         ai->kf_count++;
+        bucket_index_add(&ai->bucket_idx, input, new_id);
+        ema_update(ai, input);
         grid_destroy(input);
         return new_id;
     }
@@ -299,9 +523,9 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     SpatialGrid* input = grid_create();
     if (!input) return UINT32_MAX;
 
-    morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
 
     if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
 
@@ -311,9 +535,13 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     if (label) strncpy(kf->label, label, 63);
     kf->label[63] = '\0';
     kf->text_byte_count = (uint32_t)strlen(clause_text);
+    kf->topic_hash      = resolve_topic(clause_text, label);
+    kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
     keyframe_alloc_grid(kf, input);
 
     ai->kf_count++;
+    bucket_index_add(&ai->bucket_idx, input, new_id);
+    ema_update(ai, input);
     grid_destroy(input);
     return new_id;
 }
@@ -324,46 +552,23 @@ uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity
         return UINT32_MAX;
     }
 
-    /* Encode input */
     SpatialGrid* input = grid_create();
     if (!input) {
         if (out_similarity) *out_similarity = 0.0f;
         return UINT32_MAX;
     }
 
-    morpheme_init();
     layers_encode_clause(input_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
 
-    /* 2-stage matching pipeline */
-    uint32_t n = ai->kf_count;
-    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool) {
-        grid_destroy(input);
-        if (out_similarity) *out_similarity = 0.0f;
-        return UINT32_MAX;
-    }
+    /* Delegate to the unified 2-stage core. */
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, input, MATCH_PREDICT, &ctx);
 
-    /* Step 1: Overlap coarse */
-    for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
-        pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
-    }
-    topk_select(pool, n, TOP_K);
-
-    /* Step 2: RGB-weighted cosine on top-K */
-    uint32_t eval_count = (n < TOP_K) ? n : TOP_K;
-    for (uint32_t i = 0; i < eval_count; i++) {
-        pool[i].score = cosine_rgb_weighted(input, &ai->keyframes[pool[i].id].grid);
-    }
-    topk_select(pool, eval_count, 1);
-
-    uint32_t best_id = pool[0].id;
-    float best_sim = pool[0].score;
-
-    free(pool);
     grid_destroy(input);
-
-    if (out_similarity) *out_similarity = best_sim;
-    return best_id;
+    if (out_similarity) *out_similarity = r.best_score;
+    return r.best_id;
 }

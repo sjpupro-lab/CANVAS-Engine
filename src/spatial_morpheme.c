@@ -282,7 +282,12 @@ const char* pos_name(PartOfSpeech pos) {
 }
 
 void morpheme_init(void) {
-    /* Dictionaries are embedded; nothing to load */
+    /* Dictionaries are embedded and there is no I/O to perform.
+     * The guard is kept so a future switch to loaded dictionaries
+     * (e.g. runtime .txt reload) only runs once per process. */
+    static int ready = 0;
+    if (ready) return;
+    ready = 1;
 }
 
 uint32_t morpheme_analyze(const char* word, Morpheme* out, uint32_t max) {

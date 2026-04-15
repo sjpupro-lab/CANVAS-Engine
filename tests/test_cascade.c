@@ -15,21 +15,22 @@ static int tests_total  = 0;
 #define TEST(name) do { tests_total++; printf("  [TEST] %s ... ", name); fflush(stdout); } while(0)
 #define PASS()     do { tests_passed++; printf("PASS\n"); } while(0)
 
-/* ── 1. B-channel is not hash-stamped ──
-   The bitmap pattern itself (X = byte value, Y = byte order, A = layer sum)
-   is already a unique fingerprint. Per-clause B hashing stamps over that
-   pattern instead of refining it, so encode_clause leaves B untouched and
-   relies on the directional diffusion path. */
-static void test_b_channel_not_stamped(void) {
-    TEST("B-channel: encode_clause leaves B untouched");
+/* ── 1. B-channel carries a POS seed ──
+ *
+ * seed_rgb_token stamps a per-POS prior into R, G *and* B at each
+ * morpheme byte position. After layers_encode_clause the B channel
+ * should be populated for any cell that fell inside a classified
+ * morpheme, so downstream scoring (bg_score, channel_sim_B, EMA) has
+ * actual signal to refine. This replaces the older "B left at 0"
+ * invariant, which gave the matching cascade nothing useful to do on
+ * the B channel. */
+static void test_b_channel_pos_seeded(void) {
+    TEST("B-channel: encode_clause seeds B from POS");
     morpheme_init();
 
     SpatialGrid* g = grid_create();
     layers_encode_clause("the cat ate.", NULL, g);
 
-    /* Count how many active cells got a non-zero B directly from encoding.
-     * With seed_cooccurrence_b removed, every active cell should have B==0
-     * until directional diffusion runs. */
     uint32_t active = 0, stamped = 0;
     for (uint32_t i = 0; i < GRID_TOTAL; i++) {
         if (g->A[i] > 0) {
@@ -39,7 +40,7 @@ static void test_b_channel_not_stamped(void) {
     }
     printf("\n    active=%u stamped_B=%u\n", active, stamped);
     assert(active > 0);
-    assert(stamped == 0);
+    assert(stamped > 0);
 
     grid_destroy(g);
     PASS();
@@ -201,7 +202,7 @@ static void test_force_keyframe_mapping(void) {
 int main(void) {
     printf("=== test_cascade ===\n");
 
-    test_b_channel_not_stamped();
+    test_b_channel_pos_seeded();
     test_cascade_search_baseline();
     test_cascade_early_return();
     test_cascade_qa_extended();

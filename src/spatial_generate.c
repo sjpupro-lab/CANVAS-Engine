@@ -196,14 +196,61 @@ double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
     return A * R_sim * G_sim * B_sim;
 }
 
-/* ── Grid → text decoding ─────────────────────────────── */
+/* ── Grid → text decoding ───────────────────────────────
+ *
+ * Two variants live side by side:
+ *
+ *   grid_decode_text       pure row-argmax (legacy). Fast, byte-level,
+ *                          no UTF-8 awareness. Kept for callers that
+ *                          feed ASCII or don't care about multi-byte
+ *                          integrity (e.g. bench_qa byte snapshots).
+ *
+ *   grid_decode_text_utf8  UTF-8 aware. Validates lead + continuation
+ *                          bytes across consecutive rows so Korean and
+ *                          other multi-byte output doesn't clip. Used
+ *                          by ai_generate_next.
+ *
+ * Both read row-by-row and stop at the first empty row.
+ */
 
+static int utf8_lead_len(uint8_t b) {
+    if ((b & 0x80) == 0x00) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+static int utf8_is_cont(uint8_t b) { return (b & 0xC0) == 0x80; }
+
+/* Fill out_bytes with up to n x-candidates sorted by A descending.
+ * Missing slots get A=0 sentinels. */
+static void row_top_n(const SpatialGrid* g, uint32_t y,
+                      uint8_t* out_bytes, uint16_t* out_scores, int n) {
+    for (int i = 0; i < n; i++) { out_bytes[i] = 0; out_scores[i] = 0; }
+    for (uint32_t x = 0; x < GRID_SIZE; x++) {
+        uint16_t a = g->A[y * GRID_SIZE + x];
+        if (a == 0) continue;
+        for (int k = 0; k < n; k++) {
+            if (a > out_scores[k]) {
+                for (int j = n - 1; j > k; j--) {
+                    out_bytes[j]  = out_bytes[j - 1];
+                    out_scores[j] = out_scores[j - 1];
+                }
+                out_bytes[k]  = (uint8_t)x;
+                out_scores[k] = a;
+                break;
+            }
+        }
+    }
+}
+
+/* Legacy: row-argmax, one byte per row, no UTF-8 validation. */
 uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out) {
     if (!g || !out || max_out == 0) return 0;
 
     uint32_t written = 0;
     for (uint32_t y = 0; y < GRID_SIZE && written + 1 < max_out; y++) {
-        /* argmax A on this row */
         uint32_t best_x = 0;
         uint16_t best_a = 0;
         for (uint32_t x = 0; x < GRID_SIZE; x++) {
@@ -213,17 +260,111 @@ uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out) {
                 best_x = x;
             }
         }
-        if (best_a == 0) {
-            /* empty row → clause end */
-            break;
-        }
+        if (best_a == 0) break;
         out[written++] = (char)(uint8_t)best_x;
     }
     out[written] = '\0';
     return written;
 }
 
+/* UTF-8 aware: row-argmax for the lead byte, then consume
+ * `utf8_lead_len(lead) - 1` continuation bytes from the following
+ * rows. If the required continuations aren't present in the top
+ * candidates, fall back to a single-byte emit so ASCII still round-
+ * trips and garbled cells don't stall the decoder. */
+uint32_t grid_decode_text_utf8(const SpatialGrid* g, char* out, uint32_t max_out) {
+    if (!g || !out || max_out == 0) return 0;
+
+    uint32_t written = 0;
+    uint32_t y = 0;
+
+    while (y < GRID_SIZE && written + 4 < max_out) {
+        uint8_t  cands[4];
+        uint16_t scores[4];
+        row_top_n(g, y, cands, scores, 4);
+
+        if (scores[0] == 0) break;  /* empty row = clause end */
+
+        uint8_t lead = cands[0];
+        int len = utf8_lead_len(lead);
+
+        if (len == 1) {
+            out[written++] = (char)lead;
+            y++;
+            continue;
+        }
+        if (len == 0) {
+            /* stray continuation or invalid lead — keep legacy behavior:
+             * emit the raw byte and advance. */
+            out[written++] = (char)lead;
+            y++;
+            continue;
+        }
+
+        /* multi-byte: look for continuation bytes on the next rows */
+        uint8_t seq[4] = { lead, 0, 0, 0 };
+        int ok = 1;
+        for (int k = 1; k < len; k++) {
+            if (y + (uint32_t)k >= GRID_SIZE) { ok = 0; break; }
+            uint8_t  nb[4];
+            uint16_t ns[4];
+            row_top_n(g, y + (uint32_t)k, nb, ns, 4);
+            int found = 0;
+            for (int c = 0; c < 4; c++) {
+                if (ns[c] == 0) break;
+                if (utf8_is_cont(nb[c])) { seq[k] = nb[c]; found = 1; break; }
+            }
+            if (!found) { ok = 0; break; }
+        }
+
+        if (ok && written + (uint32_t)len < max_out) {
+            for (int k = 0; k < len; k++) out[written++] = (char)seq[k];
+            y += (uint32_t)len;
+        } else {
+            /* Validation failed: fall back to single-byte emit so ASCII
+             * still round-trips. */
+            out[written++] = (char)lead;
+            y++;
+        }
+    }
+
+    out[written] = '\0';
+    return written;
+}
+
 /* ── Full-clause generation ────────────────────────────── */
+
+/* ── Topic-aware next-frame lookup ──
+ *
+ * For a matched keyframe carrying a non-zero topic_hash, the "next"
+ * frame is the same-topic keyframe whose seq_in_topic is the
+ * smallest value strictly greater than the matched KF's seq. When
+ * the match has no topic_hash (label-less input) or there's nothing
+ * ahead of it in the topic, fall back to id+1 — which preserves the
+ * original generation behavior on legacy data. */
+static uint32_t find_next_in_topic(const SpatialAI* ai, uint32_t matched_id) {
+    if (matched_id >= ai->kf_count) return matched_id;
+    uint32_t topic = ai->keyframes[matched_id].topic_hash;
+    uint32_t seq   = ai->keyframes[matched_id].seq_in_topic;
+
+    if (topic == 0) {
+        /* no topic assigned: legacy sequential fallback */
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+
+    uint32_t best_next = UINT32_MAX;
+    uint32_t best_diff = UINT32_MAX;
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (ai->keyframes[i].topic_hash != topic) continue;
+        if (ai->keyframes[i].seq_in_topic <= seq) continue;
+        uint32_t diff = ai->keyframes[i].seq_in_topic - seq;
+        if (diff < best_diff) { best_diff = diff; best_next = i; }
+    }
+    if (best_next == UINT32_MAX) {
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+    return best_next;
+}
 
 uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
                           char* out, uint32_t max_out,
@@ -235,33 +376,34 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     }
 
     /* 1. Encode input through full pipeline */
-    morpheme_init();
     SpatialGrid* in_grid = grid_create();
     layers_encode_clause(input_text, NULL, in_grid);
     update_rgb_directional(in_grid);
+    apply_ema_to_grid(ai, in_grid);
 
-    /* 2. Match via SPEC §9 pipeline (overlap → RGB-weighted cosine) */
-    float sim = 0.0f;
-    uint32_t best_id = match_engine(ai, in_grid, NULL, NULL, NULL, &sim);
-    if (best_id >= ai->kf_count) {
-        /* fallback to simple predict */
-        grid_destroy(in_grid);
-        uint32_t fid = ai_predict(ai, input_text, &sim);
-        if (fid >= ai->kf_count) {
-            out[0] = '\0';
-            if (out_match_similarity) *out_match_similarity = 0.0f;
-            return 0;
-        }
-        best_id = fid;
-    } else {
-        grid_destroy(in_grid);
+    /* 2. Unified match in GENERATE mode (bg_score precision stage).
+     *    With the B channel now POS-seeded (spec v2 Mod D), MATCH_GENERATE
+     *    favors candidates whose B × G pattern matches the query, which
+     *    is a better proxy for "what should come next" than a pure
+     *    cosine. The engine's bucket index is passed through so
+     *    large-corpus retrieval stays fast. */
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, in_grid, MATCH_GENERATE, &ctx);
+    grid_destroy(in_grid);
+
+    if (out_match_similarity) *out_match_similarity = r.best_score;
+    if (r.best_id >= ai->kf_count) {
+        out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
     }
 
-    if (out_match_similarity) *out_match_similarity = sim;
+    /* 3. Next frame: topic-aware if the matched KF has a topic tag,
+     *    otherwise sequential (legacy). */
+    uint32_t target_id = find_next_in_topic(ai, r.best_id);
 
-    /* 3. Next frame = best_id + 1 (sequential keyframe order) */
-    uint32_t target_id = (best_id + 1 < ai->kf_count) ? (best_id + 1) : best_id;
-
-    /* 4. Decode target frame's grid → text */
-    return grid_decode_text(&ai->keyframes[target_id].grid, out, max_out);
+    /* 4. Decode target frame's grid → text (UTF-8 aware). */
+    return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
 }

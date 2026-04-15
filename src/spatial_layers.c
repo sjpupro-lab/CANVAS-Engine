@@ -9,18 +9,27 @@ static int pos_is_content(PartOfSpeech pos) {
     return pos == POS_NOUN || pos == POS_VERB || pos == POS_ADJ || pos == POS_UNKNOWN;
 }
 
-static void seed_rg_token(SpatialGrid* grid, uint32_t idx, PartOfSpeech pos) {
+/* Seed R/G/B from morpheme POS. The previous version (seed_rgb_token)
+ * left B at 0 on the reasoning that a per-clause hash overlay would
+ * just stamp over the underlying bitmap pattern. But an empty B
+ * channel means downstream scoring (bg_score in MATCH_GENERATE,
+ * adaptive_score weight_B) has nothing to work with. With a POS-
+ * keyed B seed, B carries the same kind of signal R/G do (a coarse
+ * content/function cluster) and can be further refined by EMA
+ * convergence across the corpus. */
+static void seed_rgb_token(SpatialGrid* grid, uint32_t idx, PartOfSpeech pos) {
     uint8_t r_seed = 0;
     uint8_t g_seed = 0;
+    uint8_t b_seed = 0;
 
     switch (pos) {
-        case POS_NOUN:     r_seed = 40;  g_seed = 30;  break;
-        case POS_VERB:     r_seed = 120; g_seed = 40;  break;
-        case POS_ADJ:      r_seed = 170; g_seed = 35;  break;
-        case POS_PARTICLE: r_seed = 8;   g_seed = 85;  break;
-        case POS_ENDING:   r_seed = 12;  g_seed = 95;  break;
-        case POS_PUNCT:    r_seed = 5;   g_seed = 120; break;
-        case POS_UNKNOWN:  r_seed = 210; g_seed = 20;  break;
+        case POS_NOUN:     r_seed = 40;  g_seed = 30;  b_seed = 100; break;
+        case POS_VERB:     r_seed = 120; g_seed = 40;  b_seed = 140; break;
+        case POS_ADJ:      r_seed = 170; g_seed = 35;  b_seed = 180; break;
+        case POS_PARTICLE: r_seed = 8;   g_seed = 85;  b_seed = 90;  break;
+        case POS_ENDING:   r_seed = 12;  g_seed = 95;  b_seed = 110; break;
+        case POS_PUNCT:    r_seed = 5;   g_seed = 120; b_seed = 60;  break;
+        case POS_UNKNOWN:  r_seed = 210; g_seed = 20;  b_seed = 200; break;
     }
 
     if (grid->R[idx] == 0) grid->R[idx] = r_seed;
@@ -28,6 +37,9 @@ static void seed_rg_token(SpatialGrid* grid, uint32_t idx, PartOfSpeech pos) {
 
     if (grid->G[idx] == 0) grid->G[idx] = g_seed;
     else grid->G[idx] = (uint8_t)(((uint16_t)grid->G[idx] + (uint16_t)g_seed) / 2u);
+
+    if (grid->B[idx] == 0) grid->B[idx] = b_seed;
+    else grid->B[idx] = (uint8_t)(((uint16_t)grid->B[idx] + (uint16_t)b_seed) / 2u);
 }
 
 LayerBitmaps* layers_create(void) {
@@ -137,9 +149,12 @@ static void layer_encode_morphemes(const char* text, uint16_t* layer, uint16_t w
     }
 }
 
-/* Seed R/G channels from morpheme POS at original byte positions.
-   This gives tile-level semantic/function priors before directional diffusion. */
-static void seed_morpheme_rg(const char* text, SpatialGrid* out_combined) {
+/* Seed R/G/B channels from morpheme POS at original byte positions.
+ * This gives tile-level semantic/function priors before directional
+ * diffusion. B is now seeded too (see seed_rgb_token) so bg_score,
+ * channel_sim_B, and the EMA on SpatialAI have actual signal to
+ * converge on instead of always seeing zeroes. */
+static void seed_morpheme_rgb(const char* text, SpatialGrid* out_combined) {
     const uint8_t* bytes = (const uint8_t*)text;
     uint32_t total_len = (uint32_t)strlen(text);
     uint32_t pos = 0;
@@ -186,7 +201,7 @@ static void seed_morpheme_rg(const char* text, SpatialGrid* out_combined) {
                 uint32_t y = bi % GRID_SIZE;
                 uint32_t idx = y * GRID_SIZE + x;
                 if (out_combined->A[idx] > 0) {
-                    seed_rg_token(out_combined, idx, morphs[m].pos);
+                    seed_rgb_token(out_combined, idx, morphs[m].pos);
                 }
             }
             local = found + tlen;
@@ -222,10 +237,10 @@ void layers_encode_clause(const char* clause_text,
         out_combined->A[i] = (sum > 65535) ? 65535 : (uint16_t)sum;
     }
 
-    /* Seed R/G before diffusion, based on morpheme POS alignment.
-     * B is intentionally left untouched here: the bitmap pattern (byte value =
-     * X, byte order = Y, 3-layer sum = brightness) is already a unique
-     * fingerprint. A per-clause B hash would stamp over that pattern rather
-     * than refine it, so we keep B to the directional diffusion path only. */
-    seed_morpheme_rg(clause_text, out_combined);
+    /* Seed R/G/B before diffusion, based on morpheme POS alignment.
+     * All three colour channels carry a per-POS prior so downstream
+     * paths (bg_score, channel_sim_B, ema_update) have signal to work
+     * with. The R/G values are still small relative to A, so the
+     * bitmap pattern itself stays dominant in cosine similarity. */
+    seed_morpheme_rgb(clause_text, out_combined);
 }

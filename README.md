@@ -102,16 +102,31 @@ Current numbers on `"귀여운 고양이가 밥을 먹는다."` (from `test_laye
 | **A** | `uint16` | Brightness / importance | 3-layer sum |
 | **R** | `uint8`  | Semantic (content-word / meaning) | morpheme POS seed + **diagonal** diffusion |
 | **G** | `uint8`  | Functional (particle / ending / punct) | morpheme POS seed + **vertical** diffusion |
-| **B** | `uint8`  | Extended (context / order / emotion slot) | left at 0 by encoder; evolves via **horizontal** diffusion |
+| **B** | `uint8`  | Extended (context / order / emotion slot) | morpheme POS seed + **horizontal** diffusion, EMA convergence |
 
 R/G/B are **not fixed tables**. After encoding, `update_rgb_directional`
 propagates each channel along its own axis inside the clause's own grid
-(never across slots, never across clauses):
+(never across slots, never across clauses). On top of that, the engine
+maintains a per-cell EMA of R/G/B that converges across the whole
+corpus:
 
 ```
   R ← diagonal neighbors  (↗ ↘ ↙ ↖)    α = 0.05   morpheme / semantic
   G ← vertical neighbors  (↑ ↓)        β = 0.08   word substitution
   B ← horizontal neighbors (← →)       γ = 0.03   clause order / context
+  EMA (all 3 channels)     α = 0.10   accumulated across every store
+```
+
+POS-keyed seeds (before directional diffusion):
+
+```
+  POS_NOUN     R=40   G=30   B=100
+  POS_VERB     R=120  G=40   B=140
+  POS_ADJ      R=170  G=35   B=180
+  POS_PARTICLE R=8    G=85   B=90
+  POS_ENDING   R=12   G=95   B=110
+  POS_PUNCT    R=5    G=120  B=60
+  POS_UNKNOWN  R=210  G=20   B=200
 ```
 
 Implementation notes that matter:
@@ -121,8 +136,10 @@ Implementation notes that matter:
 - When the average neighbor delta rounds to zero but isn't actually zero, the
   cell still moves by ±1. Small signals don't get silently killed.
 - `A` is *only* a mask here. The RGB update never edits `A`.
-- The encoder no longer stamps a per-clause B hash — the bitmap pattern
-  (X = byte value, Y = order, A = 3-layer sum) is already the fingerprint.
+- B carries a per-POS prior so `bg_score`, `channel_sim_B`, and the
+  engine-wide EMA actually have signal to work with. A per-clause
+  hash overlay on B was tried earlier and removed — it stamped over
+  the bitmap pattern instead of refining it.
 
 ### 3. Keyframe / Delta storage
 
@@ -149,7 +166,10 @@ typedef struct {
 The `test_io` roundtrip test verifies that `|sim_before − sim_after| < 0.001`
 over 700 clauses across save → destroy → load.
 
-### 4. Matching cascade
+### 4. Matching cascade — unified 2-stage core
+
+All three matching APIs (`ai_predict`, `match_engine`, `match_cascade`)
+now delegate to a single `spatial_match()` function:
 
 ```
   query clause
@@ -158,30 +178,30 @@ over 700 clauses across save → destroy → load.
   ┌─────────────────────────┐
   │ encode (3 layers)        │
   │ update_rgb_directional   │
+  │ ema_apply                │
   └───────────┬─────────────┘
               │
-        Step 1: A-only          overlap_score coarse  →  Top-K (K=8)
-              │                 cosine_a_only on Top-K
-              │                 if best ≥ 0.5  →  early return
+        Step 1: coarse          if (bucket_idx && KF ≥ 100) → hash-bucket hop
+              │                 else → full overlap_score scan
+              │                 topk_select → Top-K (K=8)
               ▼
-        Step 2: channel pair    CASCADE_QA   → rg_score
-              │                 CASCADE_GEN  → bg_score
-              │                 Top-K from all KFs
+        Step 2: precise         mode-specific scorer:
+              │                 MATCH_PREDICT  → cosine_rgb_weighted
+              │                 MATCH_SEARCH   → cosine_a_only
+              │                 MATCH_QA       → rg_score   (0..1)
+              │                 MATCH_GENERATE → bg_score   (0..1)
               ▼
-        Step 3: cross re-rank   CASCADE_QA   → ba_score on Top-K
-              │                 CASCADE_GEN  → ra_score on Top-K
-              ▼
-        Step 4 (topk only):     "other" fallback if Step 1-3 all empty
-              │
-              ▼
-        best id + similarity
+        best id + similarity + topk[]
 ```
 
-Three cascade modes expose this in `spatial_match.h`:
+`MatchContext` carries the optional bucket index and reserved slots
+for block-skip and frame-cache integration. `MatchResult` returns
+`best_id`, `best_score`, and a sorted `topk[]` of the final K
+candidates.
 
-- `CASCADE_SEARCH` — A-only top-K (pure retrieval)
-- `CASCADE_QA` — favors R×G overlap, re-ranks with B×A
-- `CASCADE_GENERATE` — favors B×G overlap, re-ranks with R×A
+All channel-pair scorers return values in **[0, 1]** — they're means
+over co-active cells, not raw sums. Threshold comparisons against
+cosine-normalized scores are well defined everywhere now.
 
 ### 5. Canvas Pool (subtitle routing)
 
@@ -251,6 +271,26 @@ Everything below is reproduced by `make test` on this branch
   load + append         OK        (4 canvases, 100 slots after append)
 ```
 
+### `stream_train` smoke test (1000 clauses over a 10k-line corpus)
+
+```
+  ingest                clauses=1000  KF=49  Δ=951   elapsed 4.64 s
+  .spai file size       17.2 MB
+  verify tail (500)     avg sim 0.9867  min 0.34  max 1.000
+  hits ≥ 0.90 / 0.50    490 / 490
+  R range               0..210
+  G range               0..120
+  B range               0..200         (POS seed active, was 0..0)
+```
+
+### Unified match performance
+
+Since `match_cascade`, `match_engine`, and `ai_predict` all
+delegate to `spatial_match()`, and since the bucket index skips
+the O(N) scan past `BUCKET_THRESHOLD = 100`, `stream_train` on the
+same 10k-line synthetic corpus went from **58.85 s → 22.14 s**
+(−62%) across the refactor.
+
 ### Cascade / canvas
 
 ```
@@ -282,6 +322,53 @@ make wiki
 ```
 
 **Requires:** GCC (C11), Make, POSIX (`posix_memalign`) or MinGW on Windows.
+For the visualizer: Python 3, `numpy`, `Pillow`, `ffmpeg`.
+
+### Streaming trainer (`stream_train`)
+
+For large corpora where the full text can't fit in RAM:
+
+```bash
+make stream
+./build/stream_train --input data/kaggle_train.txt \
+                     --max 25000 \
+                     --save build/models/wiki25k.spai \
+                     --checkpoint 5000 \
+                     --verify
+```
+
+`stream_train` reads one clause per line with `fgets` (4 KB buffer)
+and calls `ai_store_auto` per clause. Memory stays flat regardless
+of source-file size. `--checkpoint N` emits `foo.ckpt_NNNNNN.spai`
+every N clauses; `--verify` re-scans the tail after training and
+reports avg/min/max similarity plus hit counts at 0.9 / 0.5 / 0.1.
+
+### End-to-end practical test
+
+One script that builds, trains, verifies, then points at the visualizer:
+
+```bash
+./tools/run_practical_test.sh              # default: 1000 clauses
+./tools/run_practical_test.sh 5000
+./tools/run_practical_test.sh 25000 data/kaggle_train.txt
+```
+
+The checkpoint cadence is `min(N / 2, 5000)`. The corpus falls back
+to `data/sample_en.txt` / `data/sample_ko.txt` if no path is given.
+
+### Training-evolution visualizer
+
+```bash
+pip install numpy Pillow
+python3 tools/visualize_training.py build/models
+```
+
+For every `.spai` checkpoint in the directory it renders a 1280×720
+PNG (A-channel heatmap, RGB composite, KF / Δ stats, adaptive
+weights, EMA coverage, sample keyframe labels) and stitches the
+frames into `training_evolution.mp4` via `ffmpeg` at 3 s per frame.
+The RGB composite shows B actually contributing — a visual
+confirmation that the POS-keyed seed reached the stored grid.
 
 ### Benchmarks (optional)
 
@@ -298,23 +385,73 @@ make bench        # builds bench_stsb / bench_perplexity / bench_word_predict / 
 If `--save` is omitted, a run that actually trains auto-saves to
 `build/models/bench_word_predict_auto.spai`.
 
+### Quick corpus bootstrap (3k-line Wikipedia abstracts)
+
+Streams just enough of `enwiki-latest-abstract1.xml.gz` to extract
+3000 abstracts (≈ 2500 usable clauses after short-line filtering).
+Works on Kaggle / Linux. No full dump download:
+
+```python
+import os, gzip, re, urllib.request
+os.makedirs("data", exist_ok=True)
+URL  = "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-abstract1.xml.gz"
+OUT  = "data/kaggle_train.txt"
+pat, n = re.compile(rb"<abstract>([^<]+)</abstract>"), 0
+with urllib.request.urlopen(URL) as resp, gzip.GzipFile(fileobj=resp) as gz, \
+     open(OUT, "wb") as out:
+    buf = b""
+    while n < 3000:
+        c = gz.read(1 << 20)
+        if not c: break
+        buf += c
+        last = 0
+        for m in pat.finditer(buf):
+            s = m.group(1).strip()
+            if len(s) >= 20:
+                out.write(s + b"\n"); n += 1
+                if n >= 3000: break
+            last = m.end()
+        buf = buf[last:]
+print(f"{OUT}: {n} lines, {os.path.getsize(OUT)/1e6:.1f} MB")
+```
+
+Then:
+
+```bash
+./tools/run_practical_test.sh 2500 data/kaggle_train.txt
+python3 tools/visualize_training.py build/models
+```
+
 ---
 
 ## Save / Load
 
-Binary format `.spai` (`SPAI` magic, version 3):
+Binary format `.spai` — `SPAI` magic, current version **5**. Versions
+3 and 4 load transparently (missing fields default to zero).
 
 ```
   [Header 32B]   magic "SPAI" | version | kf_count | df_count | reserved[3]
 
   [Records]*     tagged stream, KFs + deltas in insertion order
-    tag 0x01  Keyframe:  id + label[64] + text_byte_count + A + R + G + B
-    tag 0x02  Delta:     id + parent_id + label[64] + count + change_ratio + entries[]
+    tag 0x01  Keyframe:  id + label[64] + text_byte_count +
+                         (v5: topic_hash + seq_in_topic) +
+                         A + R + G + B
+    tag 0x02  Delta:     id + parent_id + label[64] + count + change_ratio +
+                         entries[]  (v4+: 9 B/entry with diff_B; v3: 8 B)
     tag 0x03  Weights:   global ChannelWeight (4× float)
     tag 0x04  Canvas:    slot_count, canvas_type, frame_type, parent_canvas_id,
                          changed_ratio, classified, SlotMeta[32], A + R + G + B
     tag 0x05  Subtitle:  count + (type, topic_hash, canvas_id, slot_id, byte_length)[]
+    tag 0x06  EMA:       R[65536] + G[65536] + B[65536] + count[65536]  (float each, 1 MB)
 ```
+
+Version bumps:
+
+- **v3 → v4** added `diff_B` to `DeltaEntry` (sparse delta now covers
+  the B channel) and the EMA trailing block.
+- **v4 → v5** added `topic_hash` + `seq_in_topic` to every keyframe
+  record so `ai_generate_next` can walk same-topic threads instead
+  of falling back to `id + 1`.
 
 Public API (`include/spatial_io.h`):
 
@@ -358,7 +495,11 @@ Guarantees validated by `test_io`:
 ├── dict/                     # Korean dictionaries (nouns/verbs/adj/particles/endings)
 ├── tests/                    # 12 test binaries, 69 tests total
 ├── data/                     # Sample corpora + download scripts
-├── tools/kaggle_gpu_train.py # Optional GPU training helper
+├── tools/
+│   ├── stream_train.c         # Line-by-line streaming trainer (C binary)
+│   ├── run_practical_test.sh  # Build + train + verify wrapper
+│   ├── visualize_training.py  # .spai → PNG frames + MP4 video
+│   └── kaggle_gpu_train.py    # Optional CUDA training helper
 ├── Makefile
 ├── SPEC.md                   # Core spec (Page 1)
 ├── SPEC-ENGINE.md            # Engine optimization spec (Page 2)

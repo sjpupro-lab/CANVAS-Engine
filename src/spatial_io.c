@@ -63,6 +63,10 @@ static SpaiStatus write_keyframe_record(FILE* fp, const Keyframe* kf) {
     if (fwrite(kf->label, 1, 64, fp) != 64) return SPAI_ERR_WRITE;
     if (fwrite(&kf->text_byte_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
 
+    /* v5: topic_hash + seq_in_topic inline between metadata and grid */
+    if (fwrite(&kf->topic_hash,   sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&kf->seq_in_topic, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+
     if (fwrite(kf->grid.A, sizeof(uint16_t), GRID_TOTAL, fp) != GRID_TOTAL)
         return SPAI_ERR_WRITE;
     if (fwrite(kf->grid.R, 1, GRID_TOTAL, fp) != GRID_TOTAL) return SPAI_ERR_WRITE;
@@ -71,6 +75,10 @@ static SpaiStatus write_keyframe_record(FILE* fp, const Keyframe* kf) {
     return SPAI_OK;
 }
 
+/* v4: delta entries are written field-by-field so struct padding and
+ * future field additions don't break the on-disk format. On-disk
+ * layout per entry: u32 index | i16 diff_A | i8 diff_R | i8 diff_G |
+ * i8 diff_B  →  9 bytes. */
 static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
     uint8_t tag = SPAI_TAG_DELTA;
     if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
@@ -81,22 +89,35 @@ static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
     if (fwrite(&df->count,     sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
     if (fwrite(&df->change_ratio, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
 
-    if (df->count > 0) {
-        if (fwrite(df->entries, sizeof(DeltaEntry), df->count, fp) != df->count)
-            return SPAI_ERR_WRITE;
+    for (uint32_t i = 0; i < df->count; i++) {
+        const DeltaEntry* e = &df->entries[i];
+        if (fwrite(&e->index,  sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_A, sizeof(int16_t),  1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_R, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_G, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_B, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
     }
     return SPAI_OK;
 }
 
 /* ── Record readers ── */
 
-/* Read a keyframe record body (tag already consumed). Allocates grid channels. */
-static SpaiStatus read_keyframe_body(FILE* fp, Keyframe* kf) {
+/* Read a keyframe record body (tag already consumed). Allocates grid channels.
+ * Version-aware: v<=4 has no topic fields (zeroed), v>=5 reads the two uint32s. */
+static SpaiStatus read_keyframe_body(FILE* fp, uint32_t version, Keyframe* kf) {
     memset(kf, 0, sizeof(*kf));
 
     if (fread(&kf->id, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
     if (fread(kf->label, 1, 64, fp) != 64) return SPAI_ERR_READ;
     if (fread(&kf->text_byte_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+
+    if (version >= 5) {
+        if (fread(&kf->topic_hash,   sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&kf->seq_in_topic, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    } else {
+        kf->topic_hash   = 0;
+        kf->seq_in_topic = 0;
+    }
 
     kf->grid.A = (uint16_t*)malloc(GRID_TOTAL * sizeof(uint16_t));
     kf->grid.R = (uint8_t*) malloc(GRID_TOTAL);
@@ -116,7 +137,12 @@ static SpaiStatus read_keyframe_body(FILE* fp, Keyframe* kf) {
     return SPAI_OK;
 }
 
-static SpaiStatus read_delta_body(FILE* fp, DeltaFrame* df) {
+/* Read delta body, version-aware.
+ *   v <= 3: per-entry payload is { u32 index, i16 dA, i8 dR, i8 dG }
+ *           → 8 bytes, diff_B defaults to 0.
+ *   v >= 4: per-entry payload is { u32 index, i16 dA, i8 dR, i8 dG, i8 dB }
+ *           → 9 bytes. */
+static SpaiStatus read_delta_body(FILE* fp, uint32_t version, DeltaFrame* df) {
     memset(df, 0, sizeof(*df));
 
     if (fread(&df->id,        sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
@@ -129,8 +155,19 @@ static SpaiStatus read_delta_body(FILE* fp, DeltaFrame* df) {
     if (df->count > 0) {
         df->entries = (DeltaEntry*)malloc(df->count * sizeof(DeltaEntry));
         if (!df->entries) return SPAI_ERR_ALLOC;
-        if (fread(df->entries, sizeof(DeltaEntry), df->count, fp) != df->count)
-            return SPAI_ERR_READ;
+
+        for (uint32_t i = 0; i < df->count; i++) {
+            DeltaEntry* e = &df->entries[i];
+            if (fread(&e->index,  sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_A, sizeof(int16_t),  1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_R, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_G, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_READ;
+            if (version >= 4) {
+                if (fread(&e->diff_B, sizeof(int8_t), 1, fp) != 1) return SPAI_ERR_READ;
+            } else {
+                e->diff_B = 0;
+            }
+        }
     }
     return SPAI_OK;
 }
@@ -178,6 +215,35 @@ static SpaiStatus read_weights_body(FILE* fp, ChannelWeight* w) {
     if (fread(&w->w_R, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
     if (fread(&w->w_G, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
     if (fread(&w->w_B, sizeof(float), 1, fp) != 1) return SPAI_ERR_READ;
+    return SPAI_OK;
+}
+
+/* ── EMA record (tag 0x06, v4+) ──
+ * Layout: 4 × GRID_TOTAL × float = 1 MB
+ *   R[GRID_TOTAL] | G[GRID_TOTAL] | B[GRID_TOTAL] | count[GRID_TOTAL] */
+static SpaiStatus write_ema_record(FILE* fp, const SpatialAI* ai) {
+    uint8_t tag = SPAI_TAG_EMA;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_R,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_G,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_B,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_count, sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    return SPAI_OK;
+}
+
+static SpaiStatus read_ema_body(FILE* fp, SpatialAI* ai) {
+    if (fread(ai->ema_R,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_G,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_B,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_count, sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
     return SPAI_OK;
 }
 
@@ -327,6 +393,11 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     s = write_weights_record(fp, &ai->global_weights);
     if (s != SPAI_OK) { fclose(fp); return s; }
 
+    /* v4: EMA tables as trailing record (optional; older loaders
+     * treat the unknown tag as stop-of-stream). */
+    s = write_ema_record(fp, ai);
+    if (s != SPAI_OK) { fclose(fp); return s; }
+
     /* v3: canvases (if any) then subtitle track */
     if (ai->canvas_pool) {
         for (uint32_t i = 0; i < ai->canvas_pool->count; i++) {
@@ -383,7 +454,7 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 if (out_status) *out_status = SPAI_ERR_CORRUPT;
                 return NULL;
             }
-            s = read_keyframe_body(fp, &ai->keyframes[kfs_read]);
+            s = read_keyframe_body(fp, h.version, &ai->keyframes[kfs_read]);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;
@@ -396,7 +467,7 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 if (out_status) *out_status = SPAI_ERR_CORRUPT;
                 return NULL;
             }
-            s = read_delta_body(fp, &ai->deltas[dfs_read]);
+            s = read_delta_body(fp, h.version, &ai->deltas[dfs_read]);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;
@@ -425,6 +496,13 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 return NULL;
             }
             weight_normalize(&ai->global_weights);
+        } else if (tag == SPAI_TAG_EMA) {
+            s = read_ema_body(fp, ai);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
         } else if (tag == SPAI_TAG_CANVAS) {
             /* Lazy-create pool on first canvas record */
             SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
@@ -485,6 +563,14 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
     }
 
     fclose(fp);
+
+    /* Rebuild the bucket index over the loaded keyframes so subsequent
+     * ai_store_auto / ai_predict can use large-corpus retrieval from
+     * the first call. bucket_index_init already ran in spatial_ai_create. */
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        bucket_index_add(&ai->bucket_idx, &ai->keyframes[i].grid, i);
+    }
+
     if (out_status) *out_status = SPAI_OK;
     return ai;
 }
