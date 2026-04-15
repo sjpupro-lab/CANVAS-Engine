@@ -324,7 +324,6 @@ uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity
         return UINT32_MAX;
     }
 
-    /* Encode input */
     SpatialGrid* input = grid_create();
     if (!input) {
         if (out_similarity) *out_similarity = 0.0f;
@@ -335,35 +334,10 @@ uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity
     layers_encode_clause(input_text, NULL, input);
     update_rgb_directional(input);
 
-    /* 2-stage matching pipeline */
-    uint32_t n = ai->kf_count;
-    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool) {
-        grid_destroy(input);
-        if (out_similarity) *out_similarity = 0.0f;
-        return UINT32_MAX;
-    }
+    /* Delegate to the unified 2-stage core. */
+    MatchResult r = spatial_match(ai, input, MATCH_PREDICT, NULL);
 
-    /* Step 1: Overlap coarse */
-    for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
-        pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
-    }
-    topk_select(pool, n, TOP_K);
-
-    /* Step 2: RGB-weighted cosine on top-K */
-    uint32_t eval_count = (n < TOP_K) ? n : TOP_K;
-    for (uint32_t i = 0; i < eval_count; i++) {
-        pool[i].score = cosine_rgb_weighted(input, &ai->keyframes[pool[i].id].grid);
-    }
-    topk_select(pool, eval_count, 1);
-
-    uint32_t best_id = pool[0].id;
-    float best_sim = pool[0].score;
-
-    free(pool);
     grid_destroy(input);
-
-    if (out_similarity) *out_similarity = best_sim;
-    return best_id;
+    if (out_similarity) *out_similarity = r.best_score;
+    return r.best_id;
 }

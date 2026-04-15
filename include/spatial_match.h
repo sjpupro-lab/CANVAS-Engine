@@ -29,10 +29,14 @@ typedef struct {
     uint32_t sum[BLOCKS][BLOCKS];
 } BlockSummary;
 
-/* Hash bucket for large-scale search (SPEC-ENGINE Phase C) */
+/* Hash bucket for large-scale search (SPEC-ENGINE Phase C).
+ * `ids` grows dynamically; capacity starts at 0 and doubles on demand.
+ * bucket_index_destroy must be called before freeing a BucketIndex
+ * that has had ids registered. */
 typedef struct {
-    uint32_t ids[256];
-    uint32_t count;
+    uint32_t* ids;
+    uint32_t  count;
+    uint32_t  capacity;
 } Bucket;
 
 typedef struct {
@@ -81,15 +85,23 @@ void topk_select(Candidate* pool, uint32_t pool_size, uint32_t k);
 /* Compute grid hash based on active X coordinates */
 uint32_t grid_hash(const SpatialGrid* g);
 
-/* Initialize bucket index */
+/* Initialize bucket index. Zeroes all bucket slots; ids arrays are
+ * lazy-allocated by bucket_index_add. */
 void bucket_index_init(BucketIndex* idx);
 
-/* Add a keyframe to bucket index */
+/* Free every bucket's ids array. Safe to call on a zero-init index. */
+void bucket_index_destroy(BucketIndex* idx);
+
+/* Add a keyframe id to the bucket for `g`'s hash. Grows the bucket
+ * if needed (capacity 0 → 64 → 128 → …). */
 void bucket_index_add(BucketIndex* idx, const SpatialGrid* g, uint32_t kf_id);
 
-/* Get candidates from adjacent buckets */
-void bucket_candidates(BucketIndex* idx, uint32_t hash,
-                       int expand, uint32_t* out, uint32_t* out_count);
+/* Collect candidate keyframe ids from buckets [hash - expand,
+ * hash + expand]. Writes at most `max_out` ids; *out_count receives
+ * the number written. */
+void bucket_candidates(BucketIndex* idx, uint32_t hash, int expand,
+                       uint32_t* out, uint32_t* out_count,
+                       uint32_t max_out);
 
 /* ── Channel cascade matching ─────────────────────────────
  * Lego-block style staged matching: channels are combined in
@@ -152,6 +164,8 @@ float rg_score(const SpatialGrid* a, const SpatialGrid* b);
 float bg_score(const SpatialGrid* a, const SpatialGrid* b);
 float ba_score(const SpatialGrid* a, const SpatialGrid* b);
 float ra_score(const SpatialGrid* a, const SpatialGrid* b);
+
+/* ── Unified matching entry point (see below, after ChannelWeight) ── */
 
 /* ── Adaptive channel weights ───────────────────────────
  *
@@ -224,5 +238,41 @@ uint32_t match_cascade_topk_weighted(
     uint32_t k,
     uint32_t* out_ids,
     float* out_scores);
+
+/* ── Unified matching entry point (Mod 1) ──
+ *
+ * Pass NULL for ctx to use default settings. When ctx->bucket_idx is
+ * supplied and ai->kf_count >= BUCKET_THRESHOLD, the coarse stage uses
+ * the hash bucket instead of a full overlap scan. block_cache and
+ * frame_cache are accepted for API symmetry but are currently unused
+ * — the underlying cosine paths are already cache-free.
+ *
+ * frame_cache is held as an opaque pointer to keep spatial_match.h
+ * independent of spatial_context.h. */
+typedef struct {
+    BucketIndex*         bucket_idx;
+    BlockSummary*        block_cache;
+    void*                frame_cache;  /* opaque; FrameCache* in practice */
+    const ChannelWeight* weights;
+} MatchContext;
+
+typedef struct {
+    uint32_t  best_id;
+    float     best_score;
+    Candidate topk[TOP_K];
+    uint32_t  topk_count;
+} MatchResult;
+
+typedef enum {
+    MATCH_PREDICT  = 0,  /* overlap → cosine_rgb_weighted (default retrieval) */
+    MATCH_SEARCH   = 1,  /* overlap → cosine_a_only (structural) */
+    MATCH_QA       = 2,  /* overlap → rg_score (content-channel pair) */
+    MATCH_GENERATE = 3   /* overlap → bg_score (extended-channel pair) */
+} MatchMode;
+
+MatchResult spatial_match(SpatialAI* ai,
+                          const SpatialGrid* input,
+                          MatchMode mode,
+                          const MatchContext* ctx);
 
 #endif /* SPATIAL_MATCH_H */

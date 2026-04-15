@@ -196,29 +196,112 @@ double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
     return A * R_sim * G_sim * B_sim;
 }
 
-/* ── Grid → text decoding ─────────────────────────────── */
+/* ── Grid → text decoding ───────────────────────────────
+ *
+ * Reads row by row, argmax-A per row = most likely byte at that
+ * position. Bytes are UTF-8, so we validate each decoded byte:
+ *
+ *   - ASCII (0xxxxxxx):   emit, advance 1 row
+ *   - 2-byte lead (110xxxxx): expect 1 continuation byte on the next row
+ *   - 3-byte lead (1110xxxx): expect 2 continuations (Korean sits here)
+ *   - 4-byte lead (11110xxx): expect 3 continuations
+ *   - continuation (10xxxxxx): if we see this out of place, or the
+ *     required number of continuations don't appear at the next rows,
+ *     fall back to the raw best-x (legacy behavior) to preserve
+ *     round-trip for training data where the grid was already valid.
+ *
+ * This keeps ASCII-only output identical to the old byte-argmax path
+ * and stops obvious multi-byte clipping on Korean clauses.
+ */
+
+static int utf8_lead_len(uint8_t b) {
+    if ((b & 0x80) == 0x00) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+static int utf8_is_cont(uint8_t b) { return (b & 0xC0) == 0x80; }
+
+/* Fill out_bytes with up to n x-candidates sorted by A descending.
+ * Missing slots get A=0 sentinels. */
+static void row_top_n(const SpatialGrid* g, uint32_t y,
+                      uint8_t* out_bytes, uint16_t* out_scores, int n) {
+    for (int i = 0; i < n; i++) { out_bytes[i] = 0; out_scores[i] = 0; }
+    for (uint32_t x = 0; x < GRID_SIZE; x++) {
+        uint16_t a = g->A[y * GRID_SIZE + x];
+        if (a == 0) continue;
+        for (int k = 0; k < n; k++) {
+            if (a > out_scores[k]) {
+                for (int j = n - 1; j > k; j--) {
+                    out_bytes[j]  = out_bytes[j - 1];
+                    out_scores[j] = out_scores[j - 1];
+                }
+                out_bytes[k]  = (uint8_t)x;
+                out_scores[k] = a;
+                break;
+            }
+        }
+    }
+}
 
 uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out) {
     if (!g || !out || max_out == 0) return 0;
 
     uint32_t written = 0;
-    for (uint32_t y = 0; y < GRID_SIZE && written + 1 < max_out; y++) {
-        /* argmax A on this row */
-        uint32_t best_x = 0;
-        uint16_t best_a = 0;
-        for (uint32_t x = 0; x < GRID_SIZE; x++) {
-            uint32_t i = y * GRID_SIZE + x;
-            if (g->A[i] > best_a) {
-                best_a = g->A[i];
-                best_x = x;
+    uint32_t y = 0;
+
+    while (y < GRID_SIZE && written + 4 < max_out) {
+        uint8_t  cands[4];
+        uint16_t scores[4];
+        row_top_n(g, y, cands, scores, 4);
+
+        if (scores[0] == 0) break;  /* empty row = clause end */
+
+        uint8_t lead = cands[0];
+        int len = utf8_lead_len(lead);
+
+        if (len == 1) {
+            out[written++] = (char)lead;
+            y++;
+            continue;
+        }
+        if (len == 0) {
+            /* stray continuation or invalid lead — keep legacy behavior:
+             * emit the raw byte and advance. */
+            out[written++] = (char)lead;
+            y++;
+            continue;
+        }
+
+        /* multi-byte: look for continuation bytes on the next rows */
+        uint8_t seq[4] = { lead, 0, 0, 0 };
+        int ok = 1;
+        for (int k = 1; k < len; k++) {
+            if (y + (uint32_t)k >= GRID_SIZE) { ok = 0; break; }
+            uint8_t  nb[4];
+            uint16_t ns[4];
+            row_top_n(g, y + (uint32_t)k, nb, ns, 4);
+            int found = 0;
+            for (int c = 0; c < 4; c++) {
+                if (ns[c] == 0) break;
+                if (utf8_is_cont(nb[c])) { seq[k] = nb[c]; found = 1; break; }
             }
+            if (!found) { ok = 0; break; }
         }
-        if (best_a == 0) {
-            /* empty row → clause end */
-            break;
+
+        if (ok && written + (uint32_t)len < max_out) {
+            for (int k = 0; k < len; k++) out[written++] = (char)seq[k];
+            y += (uint32_t)len;
+        } else {
+            /* Validation failed: fall back to single-byte emit so ASCII
+             * still round-trips. */
+            out[written++] = (char)lead;
+            y++;
         }
-        out[written++] = (char)(uint8_t)best_x;
     }
+
     out[written] = '\0';
     return written;
 }

@@ -265,30 +265,50 @@ uint32_t grid_hash(const SpatialGrid* g) {
 
 void bucket_index_init(BucketIndex* idx) {
     if (!idx) return;
-    memset(idx, 0, sizeof(BucketIndex));
+    for (int i = 0; i < NUM_BUCKETS; i++) {
+        idx->buckets[i].ids      = NULL;
+        idx->buckets[i].count    = 0;
+        idx->buckets[i].capacity = 0;
+    }
+}
+
+void bucket_index_destroy(BucketIndex* idx) {
+    if (!idx) return;
+    for (int i = 0; i < NUM_BUCKETS; i++) {
+        free(idx->buckets[i].ids);
+        idx->buckets[i].ids      = NULL;
+        idx->buckets[i].count    = 0;
+        idx->buckets[i].capacity = 0;
+    }
 }
 
 void bucket_index_add(BucketIndex* idx, const SpatialGrid* g, uint32_t kf_id) {
     if (!idx || !g) return;
     uint32_t h = grid_hash(g);
     Bucket* b = &idx->buckets[h];
-    if (b->count < 256) {
-        b->ids[b->count++] = kf_id;
+
+    if (b->count >= b->capacity) {
+        uint32_t new_cap = b->capacity ? b->capacity * 2 : 64;
+        uint32_t* tmp = (uint32_t*)realloc(b->ids, new_cap * sizeof(uint32_t));
+        if (!tmp) return;  /* allocation failure: silently drop */
+        b->ids      = tmp;
+        b->capacity = new_cap;
     }
+    b->ids[b->count++] = kf_id;
 }
 
-void bucket_candidates(BucketIndex* idx, uint32_t hash,
-                       int expand, uint32_t* out, uint32_t* out_count) {
+void bucket_candidates(BucketIndex* idx, uint32_t hash, int expand,
+                       uint32_t* out, uint32_t* out_count,
+                       uint32_t max_out) {
     if (!idx || !out || !out_count) return;
     *out_count = 0;
 
     for (int d = -expand; d <= expand; d++) {
-        uint32_t bi = (hash + d + NUM_BUCKETS) % NUM_BUCKETS;
+        uint32_t bi = (uint32_t)((int)hash + d + (int)NUM_BUCKETS) % NUM_BUCKETS;
         Bucket* b = &idx->buckets[bi];
         for (uint32_t i = 0; i < b->count; i++) {
-            if (*out_count < 1024) {
-                out[(*out_count)++] = b->ids[i];
-            }
+            if (*out_count >= max_out) return;
+            out[(*out_count)++] = b->ids[i];
         }
     }
 }
@@ -349,33 +369,99 @@ float ra_score(const SpatialGrid* a, const SpatialGrid* b) {
     return (float)s;
 }
 
-/* ── Cascade Step 1: overlap coarse → cosine_a_only → best ── */
+/* ── Unified matching entry point (Mod 1) ───────────────── */
 
-static uint32_t cascade_step1_best(SpatialAI* ai, SpatialGrid* input,
-                                   float* out_a_sim) {
+MatchResult spatial_match(SpatialAI* ai,
+                          const SpatialGrid* input,
+                          MatchMode mode,
+                          const MatchContext* ctx) {
+    MatchResult result;
+    memset(&result, 0, sizeof(result));
+    if (!ai || !input || ai->kf_count == 0) return result;
+
     uint32_t n = ai->kf_count;
     Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool) { if (out_a_sim) *out_a_sim = 0.0f; return 0; }
+    if (!pool) return result;
 
-    /* Stage 1a: overlap coarse over all KFs */
-    for (uint32_t i = 0; i < n; i++) {
-        pool[i].id = i;
-        pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
+    /* ── Step 1: coarse candidate pool ──
+     * Bucket path activates only when the caller provides an index AND
+     * the corpus is large enough (>= BUCKET_THRESHOLD). If the bucket
+     * returns fewer than TOP_K candidates, fall back to a full scan. */
+    uint32_t pool_size = 0;
+
+    if (ctx && ctx->bucket_idx && n >= BUCKET_THRESHOLD) {
+        uint32_t cand_ids[1024];
+        uint32_t cand_count = 0;
+        uint32_t h = grid_hash(input);
+        bucket_candidates(ctx->bucket_idx, h, 5, cand_ids, &cand_count,
+                          (uint32_t)(sizeof(cand_ids) / sizeof(cand_ids[0])));
+
+        if (cand_count >= TOP_K) {
+            for (uint32_t i = 0; i < cand_count; i++) {
+                pool[i].id = cand_ids[i];
+                pool[i].score = (float)overlap_score(input,
+                                      &ai->keyframes[cand_ids[i]].grid);
+            }
+            pool_size = cand_count;
+        }
     }
-    uint32_t k = (TOP_K < n) ? TOP_K : n;
-    topk_select(pool, n, k);
 
-    /* Stage 1b: A-only cosine on top-K */
-    uint32_t best_id = pool[0].id;
-    float    best    = -1.0f;
+    if (pool_size == 0) {
+        for (uint32_t i = 0; i < n; i++) {
+            pool[i].id = i;
+            pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
+        }
+        pool_size = n;
+    }
+
+    uint32_t k = (pool_size < TOP_K) ? pool_size : TOP_K;
+    topk_select(pool, pool_size, k);
+
+    /* ── Step 2: precise scoring on the top-K ── */
     for (uint32_t i = 0; i < k; i++) {
-        float s = cosine_a_only(input, &ai->keyframes[pool[i].id].grid);
-        if (s > best) { best = s; best_id = pool[i].id; }
+        const SpatialGrid* kf = &ai->keyframes[pool[i].id].grid;
+        switch (mode) {
+            case MATCH_PREDICT:  pool[i].score = cosine_rgb_weighted(input, kf); break;
+            case MATCH_SEARCH:   pool[i].score = cosine_a_only(input, kf);       break;
+            case MATCH_QA:       pool[i].score = rg_score(input, kf);            break;
+            case MATCH_GENERATE: pool[i].score = bg_score(input, kf);            break;
+            default:             pool[i].score = cosine_rgb_weighted(input, kf); break;
+        }
+    }
+
+    /* Sort the rescored top-K descending. topk_select's fast-path returns
+     * when pool_size == k, so do it inline — k ≤ TOP_K (8), O(k²) trivial. */
+    for (uint32_t i = 0; i < k; i++) {
+        uint32_t max_i = i;
+        for (uint32_t j = i + 1; j < k; j++) {
+            if (pool[j].score > pool[max_i].score) max_i = j;
+        }
+        if (max_i != i) {
+            Candidate tmp = pool[i];
+            pool[i]       = pool[max_i];
+            pool[max_i]   = tmp;
+        }
+    }
+
+    /* ── Assemble result ── */
+    result.best_id    = pool[0].id;
+    result.best_score = pool[0].score;
+    result.topk_count = k;
+    for (uint32_t i = 0; i < k && i < TOP_K; i++) {
+        result.topk[i] = pool[i];
     }
 
     free(pool);
-    if (out_a_sim) *out_a_sim = (best < 0 ? 0.0f : best);
-    return best_id;
+    return result;
+}
+
+/* ── Cascade Step 1 delegates to spatial_match(MATCH_SEARCH) ── */
+
+static uint32_t cascade_step1_best(SpatialAI* ai, SpatialGrid* input,
+                                   float* out_a_sim) {
+    MatchResult r = spatial_match(ai, input, MATCH_SEARCH, NULL);
+    if (out_a_sim) *out_a_sim = (r.best_score < 0.0f) ? 0.0f : r.best_score;
+    return r.best_id;
 }
 
 /* ── Public: match_cascade ─────────────────────────────── */

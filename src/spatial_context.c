@@ -166,103 +166,27 @@ uint32_t context_add_frame(ContextManager* ctx, SpatialAI* ai,
     return fid;
 }
 
-/* ── Integrated matching engine (SPEC-ENGINE final) ── */
-
+/* ── Integrated matching engine ──
+ *
+ * Thin wrapper over spatial_match(MATCH_PREDICT). The bucket index is
+ * honored; bs_all (block-skip precomputed sums) and the frame cache
+ * are accepted for API compatibility but do not meaningfully change
+ * the result — spatial_match already produces the same scoring, and
+ * the cache only held pointers into ai->keyframes that never relocate.
+ */
 uint32_t match_engine(SpatialAI* ai, SpatialGrid* input,
                       BucketIndex* bidx, BlockSummary* bs_all,
                       FrameCache* cache, float* out_sim) {
-    if (!ai || !input || ai->kf_count == 0) {
-        if (out_sim) *out_sim = 0.0f;
-        return UINT32_MAX;
-    }
+    (void)bs_all;
+    (void)cache;
 
-    uint32_t n = ai->kf_count;
-    Candidate* pool = (Candidate*)malloc(n * sizeof(Candidate));
-    if (!pool) {
-        if (out_sim) *out_sim = 0.0f;
-        return UINT32_MAX;
-    }
-    uint32_t pool_size = 0;
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = bidx;
 
-    /* Step 1: Adaptive candidate selection */
-    if (n < BUCKET_THRESHOLD) {
-        /* Small-scale: full overlap scan */
-        for (uint32_t i = 0; i < n; i++) {
-            pool[i].id = i;
-            pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
-        }
-        pool_size = n;
-    } else if (bidx) {
-        /* Large-scale: bucket → overlap */
-        uint32_t cand_ids[1024];
-        uint32_t cand_count = 0;
-        uint32_t h = grid_hash(input);
-        bucket_candidates(bidx, h, 5, cand_ids, &cand_count);
+    MatchResult r = spatial_match(ai, input, MATCH_PREDICT, &ctx);
 
-        if (cand_count < TOP_K) {
-            /* Fallback: full scan */
-            for (uint32_t i = 0; i < n; i++) {
-                pool[i].id = i;
-                pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
-            }
-            pool_size = n;
-        } else {
-            for (uint32_t i = 0; i < cand_count && i < 1024; i++) {
-                pool[i].id = cand_ids[i];
-                pool[i].score = (float)overlap_score(input, &ai->keyframes[cand_ids[i]].grid);
-            }
-            pool_size = (cand_count < 1024) ? cand_count : 1024;
-        }
-    } else {
-        /* No bucket index: full scan */
-        for (uint32_t i = 0; i < n; i++) {
-            pool[i].id = i;
-            pool[i].score = (float)overlap_score(input, &ai->keyframes[i].grid);
-        }
-        pool_size = n;
-    }
-
-    /* Top-K selection */
-    topk_select(pool, pool_size, TOP_K);
-
-    /* Step 2: Precise cosine with cache + block skip */
-    BlockSummary inp_bs;
-    compute_block_sums(input, &inp_bs);
-
-    uint32_t best_id = 0;
-    float best_sim = -1.0f;
-    uint32_t eval_count = (pool_size < TOP_K) ? pool_size : TOP_K;
-
-    for (uint32_t i = 0; i < eval_count; i++) {
-        uint32_t fid = pool[i].id;
-
-        /* Cache lookup */
-        SpatialGrid* target = NULL;
-        if (cache) {
-            target = cache_get(cache, fid);
-        }
-        if (!target) {
-            target = &ai->keyframes[fid].grid;
-            if (cache) {
-                cache_put(cache, fid, target);
-            }
-        }
-
-        float sim;
-        if (bs_all) {
-            sim = cosine_block_skip(input, target, &inp_bs, &bs_all[fid]);
-        } else {
-            sim = cosine_rgb_weighted(input, target);
-        }
-
-        if (sim > best_sim) {
-            best_sim = sim;
-            best_id = fid;
-        }
-    }
-
-    free(pool);
-
-    if (out_sim) *out_sim = best_sim;
-    return best_id;
+    if (out_sim) *out_sim = r.best_score;
+    if (!ai || ai->kf_count == 0) return UINT32_MAX;
+    return r.best_id;
 }
