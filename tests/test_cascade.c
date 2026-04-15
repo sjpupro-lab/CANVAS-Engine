@@ -15,42 +15,33 @@ static int tests_total  = 0;
 #define TEST(name) do { tests_total++; printf("  [TEST] %s ... ", name); fflush(stdout); } while(0)
 #define PASS()     do { tests_passed++; printf("PASS\n"); } while(0)
 
-/* ── 1. B-channel co-occurrence hash ──
-   Two clauses that contain the same set of bytes get identical B
-   fingerprints, even if byte order differs. */
-static void test_b_cooccurrence_hash(void) {
-    TEST("B-channel hash: same vocabulary → same B");
+/* ── 1. B-channel is not hash-stamped ──
+   The bitmap pattern itself (X = byte value, Y = byte order, A = layer sum)
+   is already a unique fingerprint. Per-clause B hashing stamps over that
+   pattern instead of refining it, so encode_clause leaves B untouched and
+   relies on the directional diffusion path. */
+static void test_b_channel_not_stamped(void) {
+    TEST("B-channel: encode_clause leaves B untouched");
     morpheme_init();
 
-    SpatialGrid* g1 = grid_create();
-    SpatialGrid* g2 = grid_create();
-    SpatialGrid* g3 = grid_create();
+    SpatialGrid* g = grid_create();
+    layers_encode_clause("the cat ate.", NULL, g);
 
-    /* Same letters, different order */
-    layers_encode_clause("the cat ate.",  NULL, g1);
-    layers_encode_clause("cat ate the.",  NULL, g2);
-    /* Different letter set */
-    layers_encode_clause("dogs run fast.", NULL, g3);
+    /* Count how many active cells got a non-zero B directly from encoding.
+     * With seed_cooccurrence_b removed, every active cell should have B==0
+     * until directional diffusion runs. */
+    uint32_t active = 0, stamped = 0;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (g->A[i] > 0) {
+            active++;
+            if (g->B[i] != 0) stamped++;
+        }
+    }
+    printf("\n    active=%u stamped_B=%u\n", active, stamped);
+    assert(active > 0);
+    assert(stamped == 0);
 
-    /* Find first active cell in g1 and read its B */
-    uint8_t b1 = 0, b2 = 0, b3 = 0;
-    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
-        if (g1->A[i] > 0) { b1 = g1->B[i]; break; }
-    }
-    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
-        if (g2->A[i] > 0) { b2 = g2->B[i]; break; }
-    }
-    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
-        if (g3->A[i] > 0) { b3 = g3->B[i]; break; }
-    }
-    printf("\n    b('the cat ate')=%u  b('cat ate the')=%u  b('dogs run fast')=%u\n",
-           b1, b2, b3);
-    assert(b1 == b2);   /* same vocabulary → same hash */
-    assert(b1 != b3);   /* different vocabulary → different hash (with high prob) */
-
-    grid_destroy(g1);
-    grid_destroy(g2);
-    grid_destroy(g3);
+    grid_destroy(g);
     PASS();
 }
 
@@ -210,7 +201,7 @@ static void test_force_keyframe_mapping(void) {
 int main(void) {
     printf("=== test_cascade ===\n");
 
-    test_b_cooccurrence_hash();
+    test_b_channel_not_stamped();
     test_cascade_search_baseline();
     test_cascade_early_return();
     test_cascade_qa_extended();

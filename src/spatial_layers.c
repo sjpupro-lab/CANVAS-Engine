@@ -194,35 +194,6 @@ static void seed_morpheme_rg(const char* text, SpatialGrid* out_combined) {
     }
 }
 
-/* Seed B channel with a co-occurrence hash of the clause's unique active
- * byte values. Every A>0 cell in the clause receives the same hash h, so
- * two clauses with the same vocabulary get identical B fingerprints.
- *
- * This survives update_rgb_directional's horizontal diffusion because
- * all active neighbors share h (intra-clause diff is zero), while
- * different clauses compare at the B-channel level by vocabulary overlap.
- */
-static void seed_cooccurrence_b(const char* text, SpatialGrid* grid) {
-    if (!text || !grid) return;
-
-    /* 1. Collect unique active X values (= unique byte values) */
-    uint8_t seen[256] = {0};
-    const uint8_t* bytes = (const uint8_t*)text;
-    for (uint32_t i = 0; bytes[i]; i++) seen[bytes[i]] = 1;
-
-    /* 2. Hash: iterate X = 0..255 in ascending order for determinism */
-    uint8_t h = 0;
-    for (int x = 0; x < 256; x++) {
-        if (seen[x]) h = (uint8_t)(h * 31u + (uint32_t)x);
-    }
-
-    /* 3. Paint h on every A>0 cell. Skip zero (leave inactive cells at 0). */
-    if (h == 0) h = 1;  /* avoid collision with "inactive" sentinel */
-    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
-        if (grid->A[i] > 0) grid->B[i] = h;
-    }
-}
-
 void layers_encode_clause(const char* clause_text,
                           LayerBitmaps* out_layers,
                           SpatialGrid* out_combined) {
@@ -251,12 +222,10 @@ void layers_encode_clause(const char* clause_text,
         out_combined->A[i] = (sum > 65535) ? 65535 : (uint16_t)sum;
     }
 
-    /* Seed R/G before diffusion, based on morpheme POS alignment. */
+    /* Seed R/G before diffusion, based on morpheme POS alignment.
+     * B is intentionally left untouched here: the bitmap pattern (byte value =
+     * X, byte order = Y, 3-layer sum = brightness) is already a unique
+     * fingerprint. A per-clause B hash would stamp over that pattern rather
+     * than refine it, so we keep B to the directional diffusion path only. */
     seed_morpheme_rg(clause_text, out_combined);
-
-    /* Seed B with the clause's co-occurrence hash BEFORE RGB diffusion.
-     * Callers who subsequently run update_rgb_directional will still see
-     * this fingerprint preserved (same-h neighbors diffuse with zero diff).
-     */
-    seed_cooccurrence_b(clause_text, out_combined);
 }
