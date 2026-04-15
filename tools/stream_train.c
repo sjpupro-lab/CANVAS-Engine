@@ -48,6 +48,7 @@
 typedef struct {
     const char* input;
     const char* save;
+    const char* event_log;    /* --log <path>; NULL = disabled */
     uint32_t    max_clauses;
     uint32_t    checkpoint;
     int         verbose;
@@ -58,12 +59,15 @@ typedef struct {
 static void usage(const char* prog) {
     fprintf(stderr,
         "usage: %s --input <path> [--max N] [--save path] [--checkpoint N]\n"
-        "       [--threshold F] [--verbose] [--verify]\n"
+        "       [--log path] [--threshold F] [--verbose] [--verify]\n"
         "\n"
         "  --input <path>      input text file, one clause per line (required)\n"
         "  --max <N>           max clauses to ingest (default %d)\n"
         "  --save <path>       final model path (default build/models/stream_auto.spai)\n"
         "  --checkpoint <N>    save every N clauses (default %d, 0 disables)\n"
+        "  --log <path>        emit a binary training-event log consumed by\n"
+        "                      tools/animate_training.py (clause-level cell\n"
+        "                      events for the twinkling-grid visualization)\n"
         "  --threshold <F>     delta decision threshold in [0, 1]\n"
         "                      (default 0.30; try 0.15 on wiki-style corpora)\n"
         "  --verbose           per-clause progress line\n"
@@ -74,6 +78,7 @@ static void usage(const char* prog) {
 static int parse_args(int argc, char** argv, StreamArgs* a) {
     a->input       = NULL;
     a->save        = "build/models/stream_auto.spai";
+    a->event_log   = NULL;
     a->max_clauses = DEFAULT_MAX;
     a->checkpoint  = DEFAULT_CKPT;
     a->verbose     = 0;
@@ -94,6 +99,8 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
             long v = strtol(argv[++i], NULL, 10);
             if (v < 0) v = 0;
             a->checkpoint = (uint32_t)v;
+        } else if (strcmp(k, "--log") == 0 && i + 1 < argc) {
+            a->event_log = argv[++i];
         } else if (strcmp(k, "--threshold") == 0 && i + 1 < argc) {
             a->threshold = strtof(argv[++i], NULL);
         } else if (strcmp(k, "--verbose") == 0) {
@@ -264,6 +271,79 @@ static void report_engine_stats(const SpatialAI* ai) {
     printf("  B range:         %u..%u\n", b_min, b_max);
 }
 
+/* ── event log ──
+ *
+ * Binary stream consumed by tools/animate_training.py to render the
+ * training trajectory as a twinkling 256x256 grid animation.
+ *
+ * Layout:
+ *   header (12 B):
+ *     char     magic[4] = "CEVT"
+ *     uint32   version  = 1
+ *     uint32   reserved = 0
+ *
+ *   per clause record (variable):
+ *     uint32   clause_idx
+ *     uint8    decision    ( 0 = new keyframe,
+ *                            1 = delta,
+ *                            2 = identical / skipped )
+ *     uint16   byte_count  ( clauses longer than this are truncated
+ *                            to 65535 which is also stream_train's
+ *                            per-line cap )
+ *     uint8[byte_count * 2] = (y, x) pairs, one per byte of the
+ *                             clause: y = byte_index % 256,
+ *                             x = clause_byte_value.  Order matches
+ *                             the write order in layers_encode_clause
+ *                             so animators can replay bytes in stream
+ *                             order for extra motion.
+ */
+
+static FILE* event_log_open(const char* path) {
+    if (!path) return NULL;
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[stream] cannot open log %s\n", path);
+        return NULL;
+    }
+    const char magic[4] = { 'C', 'E', 'V', 'T' };
+    uint32_t version  = 1;
+    uint32_t reserved = 0;
+    fwrite(magic, 1, 4, f);
+    fwrite(&version,  sizeof(uint32_t), 1, f);
+    fwrite(&reserved, sizeof(uint32_t), 1, f);
+    return f;
+}
+
+static void event_log_write(FILE* f, uint32_t clause_idx,
+                            uint8_t decision, const char* text, uint32_t tlen) {
+    if (!f) return;
+    if (tlen > 65535) tlen = 65535;
+    uint16_t n = (uint16_t)tlen;
+
+    fwrite(&clause_idx, sizeof(uint32_t), 1, f);
+    fwrite(&decision,   sizeof(uint8_t),  1, f);
+    fwrite(&n,          sizeof(uint16_t), 1, f);
+
+    /* Flatten (y, x) pairs. 256 byte per-row limit matches GRID_SIZE. */
+    uint8_t buf[512];
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < tlen; i++) {
+        buf[written++] = (uint8_t)(i % 256);
+        buf[written++] = (uint8_t)(unsigned char)text[i];
+        if (written >= sizeof(buf)) {
+            fwrite(buf, 1, written, f);
+            written = 0;
+        }
+    }
+    if (written) fwrite(buf, 1, written, f);
+}
+
+static uint8_t decode_decision(uint32_t ret) {
+    if (ret == UINT32_MAX) return 2;              /* skip / error */
+    if (ret & 0x80000000u) return 1;              /* delta */
+    return 0;                                     /* new keyframe */
+}
+
 /* ── main ────────────────────────────────────────────────── */
 
 int main(int argc, char** argv) {
@@ -298,6 +378,9 @@ int main(int argc, char** argv) {
     }
 
     ensure_parent_dir(args.save);
+    if (args.event_log) ensure_parent_dir(args.event_log);
+    FILE* log = event_log_open(args.event_log);
+    if (log) printf("[stream] event log: %s\n", args.event_log);
 
     char line[LINE_BUF];
     uint32_t count = 0;
@@ -307,14 +390,18 @@ int main(int argc, char** argv) {
     while (count < args.max_clauses && fgets(line, sizeof(line), fp)) {
         strip_trailing(line);
         if (is_skippable(line)) { skipped++; continue; }
-        if (strlen(line) < MIN_CLAUSE_LEN) { skipped++; continue; }
+        uint32_t line_len = (uint32_t)strlen(line);
+        if (line_len < MIN_CLAUSE_LEN) { skipped++; continue; }
 
         /* Full training step: layers_encode_clause → update_rgb_directional
-         * → cosine vs existing KFs → delta (≥0.3) or new KF (<0.3).
+         * → cosine vs existing KFs → delta (≥threshold) or new KF (<threshold).
          * All of that lives inside ai_store_auto. */
         uint32_t rid = ai_store_auto(ai, line, NULL);
-        (void)rid;
         count++;
+
+        if (log) {
+            event_log_write(log, count - 1, decode_decision(rid), line, line_len);
+        }
 
         if (args.verbose) {
             printf("[stream] %u: kf=%u df=%u  %.40s%s\n",
@@ -351,6 +438,7 @@ int main(int argc, char** argv) {
     }
 
     fclose(fp);
+    if (log) { fclose(log); printf("[stream] event log closed\n"); }
 
     double elapsed = now_sec() - t0;
     printf("[stream] ingest done: clauses=%u skipped=%u KF=%u Delta=%u elapsed=%.2fs\n",
