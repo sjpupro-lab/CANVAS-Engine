@@ -205,6 +205,35 @@ static SpaiStatus read_weights_body(FILE* fp, ChannelWeight* w) {
     return SPAI_OK;
 }
 
+/* ── EMA record (tag 0x06, v4+) ──
+ * Layout: 4 × GRID_TOTAL × float = 1 MB
+ *   R[GRID_TOTAL] | G[GRID_TOTAL] | B[GRID_TOTAL] | count[GRID_TOTAL] */
+static SpaiStatus write_ema_record(FILE* fp, const SpatialAI* ai) {
+    uint8_t tag = SPAI_TAG_EMA;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_R,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_G,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_B,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    if (fwrite(ai->ema_count, sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_WRITE;
+    return SPAI_OK;
+}
+
+static SpaiStatus read_ema_body(FILE* fp, SpatialAI* ai) {
+    if (fread(ai->ema_R,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_G,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_B,     sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    if (fread(ai->ema_count, sizeof(float), GRID_TOTAL, fp) != GRID_TOTAL)
+        return SPAI_ERR_READ;
+    return SPAI_OK;
+}
+
 /* ── Canvas record: tag 0x04 ──
  * Layout (all little-endian native):
  *   uint32 slot_count
@@ -351,6 +380,11 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     s = write_weights_record(fp, &ai->global_weights);
     if (s != SPAI_OK) { fclose(fp); return s; }
 
+    /* v4: EMA tables as trailing record (optional; older loaders
+     * treat the unknown tag as stop-of-stream). */
+    s = write_ema_record(fp, ai);
+    if (s != SPAI_OK) { fclose(fp); return s; }
+
     /* v3: canvases (if any) then subtitle track */
     if (ai->canvas_pool) {
         for (uint32_t i = 0; i < ai->canvas_pool->count; i++) {
@@ -449,6 +483,13 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 return NULL;
             }
             weight_normalize(&ai->global_weights);
+        } else if (tag == SPAI_TAG_EMA) {
+            s = read_ema_body(fp, ai);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
         } else if (tag == SPAI_TAG_CANVAS) {
             /* Lazy-create pool on first canvas record */
             SpatialCanvasPool* pool = ai_get_canvas_pool(ai);

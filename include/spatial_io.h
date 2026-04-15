@@ -51,6 +51,7 @@
 #define SPAI_TAG_WEIGHTS   0x03   /* ChannelWeight block: 4 × float */
 #define SPAI_TAG_CANVAS    0x04   /* One SpatialCanvas (v3) */
 #define SPAI_TAG_SUBTITLE  0x05   /* SubtitleTrack (v3) */
+#define SPAI_TAG_EMA       0x06   /* SpatialAI EMA tables (v4+): 4 × GRID_TOTAL × float */
 
 typedef enum {
     SPAI_OK = 0,

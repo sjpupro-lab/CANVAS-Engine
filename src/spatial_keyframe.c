@@ -6,6 +6,76 @@
 
 #define INITIAL_CAPACITY 64
 #define SIMILARITY_THRESHOLD 0.3f
+#define EMA_ALPHA            0.1f   /* new value weight per update */
+#define EMA_MIN_EVIDENCE     2.0f   /* skip cells with fewer observations */
+
+/* ── RGB EMA ──
+ *
+ * apply_ema_to_grid blends the accumulated EMA means into an input
+ * grid's R/G/B wherever the EMA has enough evidence. The intent is to
+ * stabilize each (y, x) cell's channel values across a large corpus:
+ * individual clauses are noisy, but the mean over thousands of
+ * clauses converges to the POS / context prior for that bitmap slot.
+ *
+ * ema_update walks the active cells of a freshly stored grid and
+ * folds their R/G/B into the running means with weight EMA_ALPHA. A
+ * companion count table lets apply_ema_to_grid know how many
+ * observations back each cell; cells below EMA_MIN_EVIDENCE are left
+ * alone. The update is commutative and doesn't depend on the order
+ * in which clauses are stored.
+ */
+
+void apply_ema_to_grid(const SpatialAI* ai, SpatialGrid* grid) {
+    if (!ai || !grid) return;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (grid->A[i] == 0) continue;
+        if (ai->ema_count[i] < EMA_MIN_EVIDENCE) continue;
+
+        float er = ai->ema_R[i];
+        float eg = ai->ema_G[i];
+        float eb = ai->ema_B[i];
+
+        /* Cells that came out of the encoder with no POS seed get
+         * overwritten; cells with a seed are blended 50/50 so the
+         * local signal still matters. */
+        if (grid->R[i] == 0 && grid->G[i] == 0 && grid->B[i] == 0) {
+            grid->R[i] = (uint8_t)(er > 255.0f ? 255 : (er < 0.0f ? 0 : er));
+            grid->G[i] = (uint8_t)(eg > 255.0f ? 255 : (eg < 0.0f ? 0 : eg));
+            grid->B[i] = (uint8_t)(eb > 255.0f ? 255 : (eb < 0.0f ? 0 : eb));
+        } else {
+            float r = 0.5f * (float)grid->R[i] + 0.5f * er;
+            float g = 0.5f * (float)grid->G[i] + 0.5f * eg;
+            float b = 0.5f * (float)grid->B[i] + 0.5f * eb;
+            if (r > 255.0f) r = 255.0f; if (r < 0.0f) r = 0.0f;
+            if (g > 255.0f) g = 255.0f; if (g < 0.0f) g = 0.0f;
+            if (b > 255.0f) b = 255.0f; if (b < 0.0f) b = 0.0f;
+            grid->R[i] = (uint8_t)r;
+            grid->G[i] = (uint8_t)g;
+            grid->B[i] = (uint8_t)b;
+        }
+    }
+}
+
+void ema_update(SpatialAI* ai, const SpatialGrid* grid) {
+    if (!ai || !grid) return;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        if (grid->A[i] == 0) continue;
+        float r = (float)grid->R[i];
+        float g = (float)grid->G[i];
+        float b = (float)grid->B[i];
+
+        if (ai->ema_count[i] == 0.0f) {
+            ai->ema_R[i] = r;
+            ai->ema_G[i] = g;
+            ai->ema_B[i] = b;
+        } else {
+            ai->ema_R[i] = (1.0f - EMA_ALPHA) * ai->ema_R[i] + EMA_ALPHA * r;
+            ai->ema_G[i] = (1.0f - EMA_ALPHA) * ai->ema_G[i] + EMA_ALPHA * g;
+            ai->ema_B[i] = (1.0f - EMA_ALPHA) * ai->ema_B[i] + EMA_ALPHA * b;
+        }
+        ai->ema_count[i] += 1.0f;
+    }
+}
 
 SpatialAI* spatial_ai_create(void) {
     SpatialAI* ai = (SpatialAI*)malloc(sizeof(SpatialAI));
@@ -28,6 +98,12 @@ SpatialAI* spatial_ai_create(void) {
     /* Hash bucket index for large-corpus retrieval; populated as
      * keyframes are added. Rebuilt in ai_load after reading KFs. */
     bucket_index_init(&ai->bucket_idx);
+
+    /* EMA tables start at zero (no evidence yet). */
+    memset(ai->ema_R,     0, sizeof(ai->ema_R));
+    memset(ai->ema_G,     0, sizeof(ai->ema_G));
+    memset(ai->ema_B,     0, sizeof(ai->ema_B));
+    memset(ai->ema_count, 0, sizeof(ai->ema_count));
 
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
@@ -196,6 +272,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
     morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
 
     /* If no keyframes yet, store as first keyframe */
     if (ai->kf_count == 0) {
@@ -210,6 +287,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
 
         ai->kf_count = 1;
         bucket_index_add(&ai->bucket_idx, input, 0);
+        ema_update(ai, input);
         grid_destroy(input);
         return 0;
     }
@@ -272,6 +350,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         }
 
         ai->df_count++;
+        ema_update(ai, input);
         grid_destroy(input);
         return df->id | 0x80000000u; /* high bit indicates delta */
     } else {
@@ -302,6 +381,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
 
         ai->kf_count++;
         bucket_index_add(&ai->bucket_idx, input, new_id);
+        ema_update(ai, input);
         grid_destroy(input);
         return new_id;
     }
@@ -316,6 +396,7 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     morpheme_init();
     layers_encode_clause(clause_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
 
     if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
 
@@ -329,6 +410,7 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
 
     ai->kf_count++;
     bucket_index_add(&ai->bucket_idx, input, new_id);
+    ema_update(ai, input);
     grid_destroy(input);
     return new_id;
 }
@@ -348,9 +430,13 @@ uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity
     morpheme_init();
     layers_encode_clause(input_text, NULL, input);
     update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
 
     /* Delegate to the unified 2-stage core. */
-    MatchResult r = spatial_match(ai, input, MATCH_PREDICT, NULL);
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, input, MATCH_PREDICT, &ctx);
 
     grid_destroy(input);
     if (out_similarity) *out_similarity = r.best_score;

@@ -67,7 +67,28 @@ typedef struct SpatialAI_ {
      * (kf_count >= BUCKET_THRESHOLD) can skip the O(N) overlap scan.
      * Managed entirely in-memory; not serialized — rebuilt on load. */
     BucketIndex bucket_idx;
+
+    /* RGB EMA tables indexed by (y * 256 + x). Accumulated across
+     * every stored clause so R/G/B values stabilize at each bitmap
+     * position as training progresses. ema_count is the running
+     * number of times the cell was active; used to skip cells that
+     * haven't been seen enough to be trustworthy. Serialized as an
+     * optional SPAI_TAG_EMA trailing record. Size: 4 * GRID_TOTAL * 4
+     * bytes = 1 MB. */
+    float ema_R    [GRID_SIZE * GRID_SIZE];
+    float ema_G    [GRID_SIZE * GRID_SIZE];
+    float ema_B    [GRID_SIZE * GRID_SIZE];
+    float ema_count[GRID_SIZE * GRID_SIZE];
 } SpatialAI;
+
+/* Blend EMA into a newly-encoded grid. Called right after
+ * update_rgb_directional and before matching. Cells whose
+ * ema_count[i] < 2 are left untouched (not enough evidence). */
+void apply_ema_to_grid(const SpatialAI* ai, SpatialGrid* grid);
+
+/* Update the EMA tables from a stored grid. Called once per
+ * ai_store_auto / ai_force_keyframe after the frame is committed. */
+void ema_update(SpatialAI* ai, const SpatialGrid* grid);
 
 /* Forward declarations that avoid pulling spatial_subtitle.h into
  * every translation unit that needs SpatialAI. */
