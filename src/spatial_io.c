@@ -485,6 +485,14 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
     }
 
     fclose(fp);
+
+    /* Rebuild the bucket index over the loaded keyframes so subsequent
+     * ai_store_auto / ai_predict can use large-corpus retrieval from
+     * the first call. bucket_index_init already ran in spatial_ai_create. */
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        bucket_index_add(&ai->bucket_idx, &ai->keyframes[i].grid, i);
+    }
+
     if (out_status) *out_status = SPAI_OK;
     return ai;
 }

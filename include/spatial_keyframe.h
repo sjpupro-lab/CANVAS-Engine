@@ -57,6 +57,12 @@ typedef struct SpatialAI_ {
     /* Optional canvas pool (SPEC §6 + SubtitleTrack). NULL until
      * ai_get_canvas_pool(ai) is called. */
     struct SpatialCanvasPool_* canvas_pool;
+
+    /* Hash bucket index over all keyframes. Populated by
+     * ai_store_auto/ai_force_keyframe so large-corpus retrieval
+     * (kf_count >= BUCKET_THRESHOLD) can skip the O(N) overlap scan.
+     * Managed entirely in-memory; not serialized — rebuilt on load. */
+    BucketIndex bucket_idx;
 } SpatialAI;
 
 /* Forward declarations that avoid pulling spatial_subtitle.h into

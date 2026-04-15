@@ -25,6 +25,10 @@ SpatialAI* spatial_ai_create(void) {
     /* Canvas pool is lazily created on first ai_get_canvas_pool() call */
     ai->canvas_pool = NULL;
 
+    /* Hash bucket index for large-corpus retrieval; populated as
+     * keyframes are added. Rebuilt in ai_load after reading KFs. */
+    bucket_index_init(&ai->bucket_idx);
+
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
         return NULL;
@@ -63,6 +67,8 @@ void spatial_ai_destroy(SpatialAI* ai) {
         pool_destroy(ai->canvas_pool);
         ai->canvas_pool = NULL;
     }
+
+    bucket_index_destroy(&ai->bucket_idx);
 
     free(ai);
 }
@@ -196,21 +202,21 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         keyframe_alloc_grid(kf, input);
 
         ai->kf_count = 1;
+        bucket_index_add(&ai->bucket_idx, input, 0);
         grid_destroy(input);
         return 0;
     }
 
-    /* Find best matching keyframe */
-    float best_sim = -1.0f;
-    uint32_t best_id = 0;
-
-    for (uint32_t i = 0; i < ai->kf_count; i++) {
-        float sim = cosine_a_only(input, &ai->keyframes[i].grid);
-        if (sim > best_sim) {
-            best_sim = sim;
-            best_id = i;
-        }
-    }
+    /* Find best matching keyframe via unified 2-stage match.
+     * MATCH_SEARCH keeps the A-only cosine semantics of the original
+     * hand-rolled loop, but now benefits from the bucket index when
+     * the corpus grows past BUCKET_THRESHOLD. */
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult mr = spatial_match(ai, input, MATCH_SEARCH, &ctx);
+    float    best_sim = mr.best_score;
+    uint32_t best_id  = mr.best_id;
 
     if (best_sim >= SIMILARITY_THRESHOLD) {
         /* Store as delta frame */
@@ -288,6 +294,7 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         }
 
         ai->kf_count++;
+        bucket_index_add(&ai->bucket_idx, input, new_id);
         grid_destroy(input);
         return new_id;
     }
@@ -314,6 +321,7 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     keyframe_alloc_grid(kf, input);
 
     ai->kf_count++;
+    bucket_index_add(&ai->bucket_idx, input, new_id);
     grid_destroy(input);
     return new_id;
 }
