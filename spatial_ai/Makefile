@@ -22,7 +22,7 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle
 
-.PHONY: all clean test
+.PHONY: all clean test gpu_train_help
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -110,6 +110,12 @@ bench_word: $(BUILD_DIR)/bench_word_predict
 bench_qa: $(BUILD_DIR)/bench_qa
 	@echo "Built bench_qa. Run with:"
 	@echo "  ./build/bench_qa data/qa.tsv"
+
+gpu_train_help:
+	@echo "Kaggle GPU trainer (experimental):"
+	@echo "  pip install -r requirements-gpu.txt"
+	@echo "  python tools/kaggle_gpu_train.py --input data/sample_en.txt --max-clauses 50000 --checkpoint-every 5000"
+	@echo "  output: build/gpu_models/gpu_model_final.pt"
 
 bench: $(BUILD_DIR)/bench_stsb $(BUILD_DIR)/bench_perplexity \
        $(BUILD_DIR)/bench_word_predict $(BUILD_DIR)/bench_qa

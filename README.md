@@ -223,6 +223,72 @@ make clean
 
 **Requirements:** GCC (C11), Make, Linux/macOS/Windows (MinGW)
 
+## Recent Validation (2026-04-15)
+
+Re-validated on current `main`:
+
+- `bench_word_predict` (1000 clauses): Top-1 30.82%, Top-5 53.78%, Perplexity 98.52, PASS
+- `test_wiki` (200 clauses): Avg similarity 100.0%, Recall@1/5/10 = 78.5/89.0/96.0, PASS
+- `test_cascade`: 6/6 PASS (step routing and Top-K path)
+- quick generation diversity probe: 6 unique outputs out of 8 non-empty generations
+
+## Current 3-Layer Weights
+
+- Base: +1
+- Word: +5
+- Morpheme: +3
+
+Target overlap tiers in A-channel are 1/4/6/9.
+
+## Save/Load + Auto Save
+
+`bench_word_predict` supports:
+
+- `--save <path>`
+- `--load <path>`
+- `--load-only <path>`
+
+If `--save` is omitted and training runs, it auto-saves to:
+
+- `build/models/bench_word_predict_auto.spai`
+
+## Kaggle Free GPU Training (50,000 Clauses)
+
+Enable GPU in Kaggle notebook and run:
+
+```bash
+cd spatial_ai
+pip install -r requirements-gpu.txt
+python tools/kaggle_gpu_train.py \
+  --input data/sample_en.txt \
+  --max-clauses 50000 \
+  --checkpoint-every 5000
+```
+
+Outputs:
+
+- checkpoints: `build/gpu_models/gpu_checkpoint_*.pt`
+- final model: `build/gpu_models/gpu_model_final.pt`
+
+Also see `make gpu_train_help`.
+
+## How Sorting and Training Proceed
+
+Sorting (retrieval):
+
+1. coarse filter by `overlap_score`
+2. Top-K partial sort (`topk_select`)
+3. rerank via RGB-weighted cosine
+4. optional hash-bucket path for larger pools
+
+Training:
+
+1. 3-layer encode (base/word/morpheme)
+2. morpheme POS-based R/G seed
+3. directional RGB diffusion (R diag, G vertical, B horizontal)
+4. accumulate to keyframe/delta or canvas pool
+5. save explicitly or via autosave at end of training
+
 ## Key Properties
 
 ```

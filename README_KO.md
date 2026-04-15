@@ -223,6 +223,89 @@ make clean
 
 **필요 환경:** GCC (C11), Make, Linux/macOS/Windows (MinGW)
 
+## 최근 검증 요약 (2026-04-15)
+
+최근 main 기준으로 아래를 재검증했습니다.
+
+1. 학습 루트: `bench_word_predict` (1000 clauses)
+- Train/Test: 700/300
+- Top-1: 30.82%
+- Top-5: 53.78%
+- Perplexity: 98.52
+- PASS
+
+2. 질의/매칭 루트: `test_wiki` (200 clauses)
+- Avg similarity: 100.0%
+- Recall@1/5/10: 78.5% / 89.0% / 96.0%
+- PASS
+
+3. Cascade 경로: `test_cascade`
+- Step 1/2/3/Top-K 경로 테스트 6/6 PASS
+
+4. 생성 다양성(간단 프로브)
+- 비어있지 않은 생성 8건 중 고유 응답 6건
+
+## 3-레이어 현재 가중치
+
+현재 코드의 실가중치는 다음과 같습니다.
+
+- Base: +1
+- Word: +5
+- Morpheme: +3
+
+즉 겹침 계층은 A=1/4/6/9를 목표로 동작합니다.
+
+## 저장/로드 및 자동 저장
+
+`bench_word_predict`는 아래 동작을 지원합니다.
+
+- `--save <path>`: 명시 저장
+- `--load <path>`: 기존 모델 로드 후 학습 계속
+- `--load-only <path>`: 로드만 하고 학습 생략
+
+추가로, `--save`를 주지 않아도 학습이 수행되면 자동 저장됩니다.
+
+- 자동 저장 경로: `build/models/bench_word_predict_auto.spai`
+
+저장/로드 정합성은 `test_io`로 지속 검증합니다.
+
+## Kaggle 무료 GPU 학습 (50,000)
+
+Kaggle Notebook에서 GPU(T4/P100) 활성화 후 아래를 실행하세요.
+
+```bash
+cd spatial_ai
+pip install -r requirements-gpu.txt
+python tools/kaggle_gpu_train.py \
+  --input data/sample_en.txt \
+  --max-clauses 50000 \
+  --checkpoint-every 5000
+```
+
+출력:
+
+- 체크포인트: `build/gpu_models/gpu_checkpoint_*.pt`
+- 최종 모델: `build/gpu_models/gpu_model_final.pt`
+
+빠른 안내는 `make gpu_train_help`로 확인할 수 있습니다.
+
+## 정렬(검색)과 학습 처리 흐름
+
+정렬(검색) 처리:
+
+1. Stage 1: `overlap_score`로 coarse 후보를 고름
+2. `topk_select`로 Top-K 정렬
+3. Stage 2: RGB 가중 코사인으로 재점수화 후 최종 선택
+4. 데이터가 크면 hash bucket 경로를 병행
+
+학습 처리:
+
+1. clause를 3-layer로 인코딩 (Base/Word/Morpheme)
+2. Morpheme POS 기반 R/G 시드 반영
+3. 방향성 RGB 업데이트(R 대각선, G 수직, B 수평)
+4. keyframe/delta 또는 canvas pool에 누적
+5. 벤치 학습 종료 시 모델 저장(명시 또는 자동 저장)
+
 ## 기존 LLM과의 비교
 
 ```

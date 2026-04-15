@@ -53,6 +53,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 /* ── configuration ── */
 #define MAX_CLAUSES     10000
@@ -68,6 +70,13 @@ static double now_sec(void) {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int ensure_dir(const char* path) {
+    if (!path) return -1;
+    if (mkdir(path, 0777) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
 }
 
 /* ── text helpers ── */
@@ -258,6 +267,8 @@ int main(int argc, char* argv[]) {
             "Usage: %s <text_file> [max_clauses] [--save P] [--load P] [--load-only P]\n\n"
             "  Train: 70%%, Test: 30%% (by clause order)\n"
             "  Scoring: A x R_sim x G_sim x B_sim  (SPEC §4 §5 §9)\n\n"
+            "  Auto-save: if --save is omitted and training runs,\n"
+            "             saves to build/models/bench_word_predict_auto.spai\n\n"
             "Example:\n"
             "  %s data/sample_ko.txt --save model_ko.spai\n"
             "  %s data/sample_en.txt 1000 --load-only model_ko.spai\n",
@@ -389,6 +400,13 @@ int main(int argc, char* argv[]) {
                    ba.save_path, spai_status_str(ss),
                    ai->kf_count, ai->df_count);
         }
+    } else if (!ba.load_only) {
+        const char* auto_path = "build/models/bench_word_predict_auto.spai";
+        (void)ensure_dir("build");
+        (void)ensure_dir("build/models");
+        SpaiStatus ss = ai_save(ai, auto_path);
+        printf("  [save] auto → '%s' : %s  (%u KF, %u Delta)\n",
+               auto_path, spai_status_str(ss), ai->kf_count, ai->df_count);
     }
     printf("\n");
 
