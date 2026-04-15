@@ -9,6 +9,40 @@
 #define EMA_ALPHA            0.1f   /* new value weight per update */
 #define EMA_MIN_EVIDENCE     2.0f   /* skip cells with fewer observations */
 
+/* ── Topic hashing ──
+ *
+ * Keyframes carry a topic_hash + seq_in_topic so ai_generate_next can
+ * walk the same topic thread instead of always falling back to id+1.
+ * topic_hash is derived from the `label` argument of the store call
+ * (djb2 over the UTF-8 bytes). NULL / empty label yields 0 — callers
+ * who don't tag their clauses get the legacy sequential behavior.
+ * seq_in_topic is assigned as "one past the current max for this
+ * topic" so insertion order within a topic is preserved without
+ * needing a separate index structure. */
+static uint32_t topic_hash_from_label(const char* label) {
+    if (!label || !*label) return 0;
+    uint32_t h = 5381;
+    for (const unsigned char* p = (const unsigned char*)label; *p; p++) {
+        h = h * 33u + (uint32_t)*p;
+    }
+    return h ? h : 1; /* reserve 0 for "no topic" */
+}
+
+static uint32_t next_seq_in_topic(const SpatialAI* ai, uint32_t topic) {
+    if (topic == 0) return 0;
+    uint32_t max_seq = 0;
+    int seen = 0;
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (ai->keyframes[i].topic_hash == topic) {
+            if (!seen || ai->keyframes[i].seq_in_topic > max_seq) {
+                max_seq = ai->keyframes[i].seq_in_topic;
+            }
+            seen = 1;
+        }
+    }
+    return seen ? max_seq + 1 : 1;
+}
+
 /* ── RGB EMA ──
  *
  * apply_ema_to_grid blends the accumulated EMA means into an input
@@ -283,6 +317,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic_hash_from_label(label);
+        kf->seq_in_topic    = kf->topic_hash ? 1 : 0;
         keyframe_alloc_grid(kf, input);
 
         ai->kf_count = 1;
@@ -363,6 +399,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic_hash_from_label(label);
+        kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
         keyframe_alloc_grid(kf, input);
 
         /* Adaptive feedback for "novel" input: compare against the
@@ -406,6 +444,8 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     if (label) strncpy(kf->label, label, 63);
     kf->label[63] = '\0';
     kf->text_byte_count = (uint32_t)strlen(clause_text);
+    kf->topic_hash      = topic_hash_from_label(label);
+    kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
     keyframe_alloc_grid(kf, input);
 
     ai->kf_count++;

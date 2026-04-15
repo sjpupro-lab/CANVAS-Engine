@@ -308,6 +308,38 @@ uint32_t grid_decode_text(const SpatialGrid* g, char* out, uint32_t max_out) {
 
 /* ── Full-clause generation ────────────────────────────── */
 
+/* ── Topic-aware next-frame lookup ──
+ *
+ * For a matched keyframe carrying a non-zero topic_hash, the "next"
+ * frame is the same-topic keyframe whose seq_in_topic is the
+ * smallest value strictly greater than the matched KF's seq. When
+ * the match has no topic_hash (label-less input) or there's nothing
+ * ahead of it in the topic, fall back to id+1 — which preserves the
+ * original generation behavior on legacy data. */
+static uint32_t find_next_in_topic(const SpatialAI* ai, uint32_t matched_id) {
+    if (matched_id >= ai->kf_count) return matched_id;
+    uint32_t topic = ai->keyframes[matched_id].topic_hash;
+    uint32_t seq   = ai->keyframes[matched_id].seq_in_topic;
+
+    if (topic == 0) {
+        /* no topic assigned: legacy sequential fallback */
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+
+    uint32_t best_next = UINT32_MAX;
+    uint32_t best_diff = UINT32_MAX;
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (ai->keyframes[i].topic_hash != topic) continue;
+        if (ai->keyframes[i].seq_in_topic <= seq) continue;
+        uint32_t diff = ai->keyframes[i].seq_in_topic - seq;
+        if (diff < best_diff) { best_diff = diff; best_next = i; }
+    }
+    if (best_next == UINT32_MAX) {
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+    return best_next;
+}
+
 uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
                           char* out, uint32_t max_out,
                           float* out_match_similarity) {
@@ -322,29 +354,26 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     SpatialGrid* in_grid = grid_create();
     layers_encode_clause(input_text, NULL, in_grid);
     update_rgb_directional(in_grid);
+    apply_ema_to_grid(ai, in_grid);
 
-    /* 2. Match via SPEC §9 pipeline (overlap → RGB-weighted cosine) */
-    float sim = 0.0f;
-    uint32_t best_id = match_engine(ai, in_grid, NULL, NULL, NULL, &sim);
-    if (best_id >= ai->kf_count) {
-        /* fallback to simple predict */
-        grid_destroy(in_grid);
-        uint32_t fid = ai_predict(ai, input_text, &sim);
-        if (fid >= ai->kf_count) {
-            out[0] = '\0';
-            if (out_match_similarity) *out_match_similarity = 0.0f;
-            return 0;
-        }
-        best_id = fid;
-    } else {
-        grid_destroy(in_grid);
+    /* 2. Unified match (carries the engine-owned bucket index) */
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, in_grid, MATCH_PREDICT, &ctx);
+    grid_destroy(in_grid);
+
+    if (out_match_similarity) *out_match_similarity = r.best_score;
+    if (r.best_id >= ai->kf_count) {
+        out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
     }
 
-    if (out_match_similarity) *out_match_similarity = sim;
+    /* 3. Next frame: topic-aware if the matched KF has a topic tag,
+     *    otherwise sequential (legacy). */
+    uint32_t target_id = find_next_in_topic(ai, r.best_id);
 
-    /* 3. Next frame = best_id + 1 (sequential keyframe order) */
-    uint32_t target_id = (best_id + 1 < ai->kf_count) ? (best_id + 1) : best_id;
-
-    /* 4. Decode target frame's grid → text */
+    /* 4. Decode target frame's grid → text (UTF-8 aware, Mod 8). */
     return grid_decode_text(&ai->keyframes[target_id].grid, out, max_out);
 }

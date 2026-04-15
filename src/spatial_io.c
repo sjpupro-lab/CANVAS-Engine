@@ -63,6 +63,10 @@ static SpaiStatus write_keyframe_record(FILE* fp, const Keyframe* kf) {
     if (fwrite(kf->label, 1, 64, fp) != 64) return SPAI_ERR_WRITE;
     if (fwrite(&kf->text_byte_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
 
+    /* v5: topic_hash + seq_in_topic inline between metadata and grid */
+    if (fwrite(&kf->topic_hash,   sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&kf->seq_in_topic, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+
     if (fwrite(kf->grid.A, sizeof(uint16_t), GRID_TOTAL, fp) != GRID_TOTAL)
         return SPAI_ERR_WRITE;
     if (fwrite(kf->grid.R, 1, GRID_TOTAL, fp) != GRID_TOTAL) return SPAI_ERR_WRITE;
@@ -98,13 +102,22 @@ static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
 
 /* ── Record readers ── */
 
-/* Read a keyframe record body (tag already consumed). Allocates grid channels. */
-static SpaiStatus read_keyframe_body(FILE* fp, Keyframe* kf) {
+/* Read a keyframe record body (tag already consumed). Allocates grid channels.
+ * Version-aware: v<=4 has no topic fields (zeroed), v>=5 reads the two uint32s. */
+static SpaiStatus read_keyframe_body(FILE* fp, uint32_t version, Keyframe* kf) {
     memset(kf, 0, sizeof(*kf));
 
     if (fread(&kf->id, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
     if (fread(kf->label, 1, 64, fp) != 64) return SPAI_ERR_READ;
     if (fread(&kf->text_byte_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+
+    if (version >= 5) {
+        if (fread(&kf->topic_hash,   sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&kf->seq_in_topic, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    } else {
+        kf->topic_hash   = 0;
+        kf->seq_in_topic = 0;
+    }
 
     kf->grid.A = (uint16_t*)malloc(GRID_TOTAL * sizeof(uint16_t));
     kf->grid.R = (uint8_t*) malloc(GRID_TOTAL);
@@ -441,7 +454,7 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 if (out_status) *out_status = SPAI_ERR_CORRUPT;
                 return NULL;
             }
-            s = read_keyframe_body(fp, &ai->keyframes[kfs_read]);
+            s = read_keyframe_body(fp, h.version, &ai->keyframes[kfs_read]);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;

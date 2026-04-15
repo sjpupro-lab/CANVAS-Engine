@@ -4,12 +4,20 @@
 #include "spatial_grid.h"
 #include "spatial_match.h"
 
-/* Keyframe (I-Frame): full snapshot */
+/* Keyframe (I-Frame): full snapshot.
+ * topic_hash + seq_in_topic drive the topic-aware "next frame"
+ * lookup in ai_generate_next. Both default to 0; ai_store_auto and
+ * ai_force_keyframe derive topic_hash from the label (djb2) and
+ * assign the next seq within the same topic. Legacy v3 files
+ * load with topic_hash=0 / seq_in_topic=0 and still work via the
+ * id+1 fallback path. */
 typedef struct {
     uint32_t    id;
     char        label[64];
-    SpatialGrid grid;  /* inline grid (channels point to allocated memory) */
+    SpatialGrid grid;
     uint32_t    text_byte_count;
+    uint32_t    topic_hash;
+    uint32_t    seq_in_topic;
 } Keyframe;
 
 /* Delta entry: sparse format (SPEC-ENGINE Phase D).
