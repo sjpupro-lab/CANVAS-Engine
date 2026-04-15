@@ -179,7 +179,6 @@ R/G/B 값은 **고정 테이블이 아닙니다** — AI가 방향성 확산을 
 ## 프로젝트 구조
 
 ```
-spatial_ai/
 ├── include/                  # 헤더 파일
 │   ├── spatial_grid.h        # 256×256 격자, 인코딩/디코딩
 │   ├── spatial_layers.h      # 3-레이어 합산 엔진
@@ -200,7 +199,9 @@ spatial_ai/
 │   ├── adjectives.txt
 │   ├── particles.txt
 │   └── endings.txt
+├── data/                     # 샘플 데이터 및 다운로드 스크립트
 ├── tests/                    # 7개 테스트 스위트, 34개 테스트
+├── tools/                    # 유틸리티 (GPU 학습 등)
 ├── Makefile
 ├── SPEC.md                   # 핵심 명세서 v3.0
 └── SPEC-ENGINE.md            # 엔진 최적화 명세서
@@ -209,8 +210,6 @@ spatial_ai/
 ## 빌드 & 테스트
 
 ```bash
-cd spatial_ai
-
 # 빌드
 make all
 
@@ -274,7 +273,6 @@ make clean
 Kaggle Notebook에서 GPU(T4/P100) 활성화 후 아래를 실행하세요.
 
 ```bash
-cd spatial_ai
 pip install -r requirements-gpu.txt
 python tools/kaggle_gpu_train.py \
   --input data/sample_en.txt \

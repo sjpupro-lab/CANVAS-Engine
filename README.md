@@ -172,7 +172,6 @@ Dictionary-based longest-match tokenizer. No external libraries required.
 ## Project Structure
 
 ```
-spatial_ai/
 ├── include/              # Header files
 │   ├── spatial_grid.h        # 256×256 grid, encoding/decoding
 │   ├── spatial_layers.h      # 3-layer summation engine
@@ -201,16 +200,16 @@ spatial_ai/
 │   ├── test_keyframe.c
 │   ├── test_context.c
 │   └── test_integration.c
-├── Makefile
-├── SPEC.md                   # Core specification v3.0
-└── SPEC-ENGINE.md            # Engine optimization spec
+├── data/                 # Sample data and download scripts
+├── tools/                # Utilities (GPU training, etc.)
+├── Makefile              # Build system
+├── SPEC.md               # Core specification v3.0
+└── SPEC-ENGINE.md        # Engine optimization spec
 ```
 
 ## Build & Test
 
 ```bash
-cd spatial_ai
-
 # Build
 make all
 
