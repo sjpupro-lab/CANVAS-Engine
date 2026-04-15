@@ -111,6 +111,12 @@ void ema_update(SpatialAI* ai, const SpatialGrid* grid);
 void  ai_set_store_threshold(float t);
 float ai_get_store_threshold(void);
 
+/* Resolve the topic hash that ai_store_auto would assign to this
+ * clause/label pair. Used by calibration code that needs to look up
+ * the same topic bucket without committing the clause yet. Returns
+ * 0 when both inputs yield no bytes. */
+uint32_t ai_resolve_topic(const char* clause_text, const char* label);
+
 /* Forward declarations that avoid pulling spatial_subtitle.h into
  * every translation unit that needs SpatialAI. */
 struct SpatialCanvasPool_* ai_get_canvas_pool(SpatialAI* ai);  /* lazy create */

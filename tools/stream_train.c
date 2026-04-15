@@ -48,42 +48,52 @@
 typedef struct {
     const char* input;
     const char* save;
-    const char* event_log;    /* --log <path>; NULL = disabled */
+    const char* event_log;       /* --log <path>; NULL = disabled */
     uint32_t    max_clauses;
     uint32_t    checkpoint;
     int         verbose;
     int         verify;
-    float       threshold;    /* <0 means "leave engine default" */
+    float       threshold;       /* <0 means "leave engine default" */
+    float       target_delta;    /* <0 means "disabled" (explicit threshold wins) */
+    uint32_t    calibrate_samples;
 } StreamArgs;
 
 static void usage(const char* prog) {
     fprintf(stderr,
         "usage: %s --input <path> [--max N] [--save path] [--checkpoint N]\n"
-        "       [--log path] [--threshold F] [--verbose] [--verify]\n"
+        "       [--log path] [--threshold F | --target-delta R] [--verbose] [--verify]\n"
         "\n"
-        "  --input <path>      input text file, one clause per line (required)\n"
-        "  --max <N>           max clauses to ingest (default %d)\n"
-        "  --save <path>       final model path (default build/models/stream_auto.spai)\n"
-        "  --checkpoint <N>    save every N clauses (default %d, 0 disables)\n"
-        "  --log <path>        emit a binary training-event log consumed by\n"
-        "                      tools/animate_training.py (clause-level cell\n"
-        "                      events for the twinkling-grid visualization)\n"
-        "  --threshold <F>     delta decision threshold in [0, 1]\n"
-        "                      (default 0.30; try 0.15 on wiki-style corpora)\n"
-        "  --verbose           per-clause progress line\n"
-        "  --verify            after training, run an unseen-query sanity pass\n",
+        "  --input <path>        input text file, one clause per line (required)\n"
+        "  --max <N>             max clauses to ingest (default %d)\n"
+        "  --save <path>         final model path (default build/models/stream_auto.spai)\n"
+        "  --checkpoint <N>      save every N clauses (default %d, 0 disables)\n"
+        "  --log <path>          emit a binary training-event log consumed by\n"
+        "                        tools/animate_training.py (clause-level cell\n"
+        "                        events for the twinkling-grid visualization)\n"
+        "  --threshold <F>       delta decision threshold in [0, 1]\n"
+        "                        (default 0.30; try 0.15 on wiki-style corpora)\n"
+        "  --target-delta <R>    auto-calibrate threshold so about R (0..1) of the\n"
+        "                        first --calibrate-samples clauses would become\n"
+        "                        deltas. Ignored when --threshold is given explicitly.\n"
+        "  --calibrate-samples <N>\n"
+        "                        clauses used for --target-delta calibration\n"
+        "                        (default 500; capped at --max)\n"
+        "  --verbose             per-clause progress line\n"
+        "  --verify              after training, run an unseen-query sanity pass\n",
         prog, DEFAULT_MAX, DEFAULT_CKPT);
 }
 
 static int parse_args(int argc, char** argv, StreamArgs* a) {
-    a->input       = NULL;
-    a->save        = "build/models/stream_auto.spai";
-    a->event_log   = NULL;
-    a->max_clauses = DEFAULT_MAX;
-    a->checkpoint  = DEFAULT_CKPT;
-    a->verbose     = 0;
-    a->verify      = 0;
-    a->threshold   = -1.0f;
+    a->input             = NULL;
+    a->save              = "build/models/stream_auto.spai";
+    a->event_log         = NULL;
+    a->max_clauses       = DEFAULT_MAX;
+    a->checkpoint        = DEFAULT_CKPT;
+    a->verbose           = 0;
+    a->verify            = 0;
+    a->threshold         = -1.0f;
+    a->target_delta      = -1.0f;
+    a->calibrate_samples = 500;
 
     for (int i = 1; i < argc; i++) {
         const char* k = argv[i];
@@ -103,6 +113,14 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
             a->event_log = argv[++i];
         } else if (strcmp(k, "--threshold") == 0 && i + 1 < argc) {
             a->threshold = strtof(argv[++i], NULL);
+        } else if (strcmp(k, "--target-delta") == 0 && i + 1 < argc) {
+            a->target_delta = strtof(argv[++i], NULL);
+            if (a->target_delta < 0.0f) a->target_delta = 0.0f;
+            if (a->target_delta > 1.0f) a->target_delta = 1.0f;
+        } else if (strcmp(k, "--calibrate-samples") == 0 && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 10);
+            if (v < 10) v = 10;
+            a->calibrate_samples = (uint32_t)v;
         } else if (strcmp(k, "--verbose") == 0) {
             a->verbose = 1;
         } else if (strcmp(k, "--verify") == 0) {
@@ -344,6 +362,101 @@ static uint8_t decode_decision(uint32_t ret) {
     return 0;                                     /* new keyframe */
 }
 
+/* ── Threshold auto-calibration ──
+ *
+ * Reads the first `sample_cap` valid clauses from the input, encodes
+ * each one, and records the best cosine_a_only against prior same-
+ * topic clauses. The observed best_sim distribution is what the real
+ * ai_store_auto path would compare against threshold, so the
+ * threshold sits at the target_ratio percentile of those values.
+ *
+ * Returns a threshold in [0, 1], or -1 if calibration produced no
+ * usable samples (e.g. every clause had a unique topic).
+ *
+ * Pre-pass cost: O(N × max_topic_bucket × GRID_TOTAL). For 500
+ * samples with a handful of topics, that's a few seconds. */
+
+static int cmp_float_desc(const void* a, const void* b) {
+    float fa = *(const float*)a, fb = *(const float*)b;
+    if (fa > fb) return -1;
+    if (fa < fb) return  1;
+    return 0;
+}
+
+static float calibrate_threshold(const char* input_path,
+                                  uint32_t sample_cap,
+                                  float target_ratio) {
+    FILE* fp = fopen(input_path, "r");
+    if (!fp) return -1.0f;
+
+    SpatialAI* tmp = spatial_ai_create();
+    if (!tmp) { fclose(fp); return -1.0f; }
+
+    float*   sims   = (float*)malloc(sample_cap * sizeof(float));
+    uint32_t n_sims = 0;
+    uint32_t seen   = 0;
+
+    char line[LINE_BUF];
+    while (seen < sample_cap && fgets(line, sizeof(line), fp)) {
+        strip_trailing(line);
+        if (is_skippable(line)) continue;
+        if (strlen(line) < MIN_CLAUSE_LEN) continue;
+
+        uint32_t topic = ai_resolve_topic(line, NULL);
+
+        SpatialGrid* grid = grid_create();
+        if (!grid) break;
+        layers_encode_clause(line, NULL, grid);
+        update_rgb_directional(grid);
+
+        /* Best same-topic cosine against what we've already stored */
+        if (topic != 0 && n_sims < sample_cap) {
+            float best = 0.0f;
+            int   any  = 0;
+            for (uint32_t i = 0; i < tmp->kf_count; i++) {
+                if (tmp->keyframes[i].topic_hash != topic) continue;
+                float s = cosine_a_only(grid, &tmp->keyframes[i].grid);
+                if (s > best) best = s;
+                any = 1;
+            }
+            if (any) sims[n_sims++] = best;
+        }
+
+        /* Accumulate all calibration clauses as keyframes so subsequent
+         * same-topic clauses have something to compare against. */
+        ai_force_keyframe(tmp, line, NULL);
+        grid_destroy(grid);
+        seen++;
+    }
+    fclose(fp);
+
+    float threshold = -1.0f;
+    if (n_sims >= 10) {
+        qsort(sims, n_sims, sizeof(float), cmp_float_desc);
+        /* target_ratio fraction of clauses should be at or above
+         * threshold. With the array sorted descending, the value at
+         * position ⌊target × N⌋ is that threshold. */
+        uint32_t idx = (uint32_t)(target_ratio * (float)n_sims);
+        if (idx >= n_sims) idx = n_sims - 1;
+        threshold = sims[idx];
+        printf("[calibrate] sampled=%u  same-topic_pairs=%u\n"
+               "[calibrate] sim distribution: min=%.3f  p%02d=%.3f  p50=%.3f  p10=%.3f  max=%.3f\n",
+               seen, n_sims, sims[n_sims - 1],
+               (int)(target_ratio * 100), threshold,
+               sims[n_sims / 2], sims[n_sims / 10], sims[0]);
+        printf("[calibrate] picked threshold=%.3f for target delta ratio %.1f%%\n",
+               threshold, target_ratio * 100.0f);
+    } else {
+        printf("[calibrate] only %u same-topic pairs in %u clauses — "
+               "not enough to tune a threshold\n",
+               n_sims, seen);
+    }
+
+    free(sims);
+    spatial_ai_destroy(tmp);
+    return threshold;
+}
+
 /* ── main ────────────────────────────────────────────────── */
 
 int main(int argc, char** argv) {
@@ -361,12 +474,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Threshold precedence: explicit --threshold > --target-delta
+     * auto-calibration > engine default. */
     if (args.threshold >= 0.0f) {
         ai_set_store_threshold(args.threshold);
+    } else if (args.target_delta >= 0.0f) {
+        uint32_t sample_cap = args.calibrate_samples;
+        if (sample_cap > args.max_clauses) sample_cap = args.max_clauses;
+        printf("[calibrate] target_delta=%.1f%%  samples=%u\n",
+               args.target_delta * 100.0f, sample_cap);
+        float t = calibrate_threshold(args.input, sample_cap, args.target_delta);
+        if (t >= 0.0f) {
+            ai_set_store_threshold(t);
+        } else {
+            printf("[calibrate] falling back to engine default %.2f\n",
+                   ai_get_store_threshold());
+        }
     }
 
     printf("[stream] reading: %s\n", args.input);
-    printf("[stream] max=%u  checkpoint=%u  threshold=%.2f  save=%s\n",
+    printf("[stream] max=%u  checkpoint=%u  threshold=%.3f  save=%s\n",
            args.max_clauses, args.checkpoint,
            ai_get_store_threshold(), args.save);
 

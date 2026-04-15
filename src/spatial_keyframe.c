@@ -68,10 +68,14 @@ static uint32_t topic_hash_from_label(const char* label) {
 /* Resolve the topic for a store call: label wins if provided, else the
  * clause's first token. Returns 0 only when neither yields any bytes,
  * which we treat as "no topic" (legacy flat-scan fallback). */
-static uint32_t resolve_topic(const char* clause_text, const char* label) {
+uint32_t ai_resolve_topic(const char* clause_text, const char* label) {
     uint32_t h = topic_hash_from_label(label);
     if (h == 0) h = topic_hash_from_text(clause_text);
     return h;
+}
+
+static uint32_t resolve_topic(const char* clause_text, const char* label) {
+    return ai_resolve_topic(clause_text, label);
 }
 
 static uint32_t next_seq_in_topic(const SpatialAI* ai, uint32_t topic) {
