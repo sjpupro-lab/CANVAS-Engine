@@ -117,6 +117,15 @@ gpu_train_help:
 	@echo "  python tools/kaggle_gpu_train.py --input data/sample_en.txt --max-clauses 50000 --checkpoint-every 5000"
 	@echo "  output: build/gpu_models/gpu_model_final.pt"
 
+# ─── Streaming trainer (line-by-line, no full-file buffering) ────
+$(BUILD_DIR)/stream_train: tools/stream_train.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+stream: $(BUILD_DIR)/stream_train
+	@echo "Built stream_train. Example:"
+	@echo "  ./build/stream_train --input data/sample_en.txt --max 50000 \\"
+	@echo "                       --save build/models/wiki50k.spai --verify"
+
 bench: $(BUILD_DIR)/bench_stsb $(BUILD_DIR)/bench_perplexity \
        $(BUILD_DIR)/bench_word_predict $(BUILD_DIR)/bench_qa
 	@echo "=== Benchmarks built ==="

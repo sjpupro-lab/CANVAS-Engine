@@ -1,315 +1,449 @@
 # SPATIAL-PATTERN-AI (CANVAS)
 
-> A spatial pattern-based AI engine that encodes language as 256x256 pixel grids — treating text like video frames instead of token vectors.
+![Main Hero](main_hero.png)
+
+> A spatial pattern–based AI engine that encodes text as brightness patterns on a 256×256 grid.
+> Language is treated like video frames, not token vectors.
 
 ```
- "The cat eats rice."          256x256 Grid (1 clause = 1 frame)
-         |                    ┌────────────────────────┐
+ "The cat eats rice."          256×256 Grid  (1 clause = 1 frame)
+         │                    ┌────────────────────────┐
     UTF-8 bytes               │  ·                     │
-         |                    │    ·  ·                 │
-   ┌─────▼──────┐            │  · · ·  ·   ·          │
-   │  X = byte   │            │     ·    ·              │
-   │  Y = position│  ──────►  │  ·    ·                 │
-   │  brightness  │            │       ·  ·             │
-   │  = weight    │            │  · ·       ·  ·        │
-   └─────────────┘            └────────────────────────┘
-                               A channel: frequency heatmap
+         │                    │    ·  ·                │
+   ┌─────▼──────┐             │  · · ·  ·   ·         │
+   │ X = byte    │             │     ·    ·            │
+   │ Y = position│  ──────►   │  ·    ·                │
+   │ A = 3-layer │             │       ·  ·            │
+   │     sum     │             │  · ·       ·  ·       │
+   └─────────────┘             └────────────────────────┘
+                                A channel: byte-frequency heatmap
 ```
 
-## How It Works
+---
 
-### 1. Three-Layer Bitmap Summation
+## Table of Contents
 
-Each clause is encoded through 3 independent layers, then stacked:
+- [Why this exists](#why-this-exists)
+- [How it works](#how-it-works)
+  - [1. Three-layer bitmap summation](#1-three-layer-bitmap-summation)
+  - [2. RGBA channels](#2-rgba-channels)
+  - [3. Keyframe / Delta storage](#3-keyframe--delta-storage)
+  - [4. Matching cascade](#4-matching-cascade)
+  - [5. Canvas Pool (subtitle routing)](#5-canvas-pool-subtitle-routing)
+- [Current verified results](#current-verified-results)
+- [Build & run](#build--run)
+- [Save / Load](#save--load)
+- [Project layout](#project-layout)
+- [Engine optimizations](#engine-optimizations)
+- [Morpheme analyzer](#morpheme-analyzer)
+- [vs. Traditional LLM](#vs-traditional-llm)
+- [License](#license)
 
-```
-  Layer         Target           Weight    What it captures
- ─────────────────────────────────────────────────────────
-  Base          all bytes          +1      every byte position
-  Word          space-split words  +2      word-level emphasis
-  Morpheme      noun/verb/adj...   +1      linguistic structure
- ─────────────────────────────────────────────────────────
-  Combined = Base + Word + Morpheme    (max brightness = 4)
-```
+---
 
-```
-  Verified:  "귀여운 고양이가 밥을 먹는다."
-  ─────────────────────────────────────────
-  Base layer:      40 px, max 1, total  40
-  Word layer:      37 px, max 2, total  74
-  Morpheme layer:  37 px, max 1, total  37
-  Combined:        40 px, max 4, total 151
-                                        ↑
-            Conservation: 151 = 40 + 74 + 37  ✓
-```
+## Why this exists
 
-### 2. RGBA Channels
+A traditional LLM bakes language into a fixed-size weight matrix. Adding new data
+means re-training, and the internal state is a black box.
 
-```
-  Channel │ Role         │ Type    │ Description
- ─────────┼──────────────┼─────────┼──────────────────────────
-    A     │ Brightness   │ uint16  │ Byte frequency (3-layer sum)
-    R     │ Semantic     │ uint8   │ Meaning similarity (AI-mapped)
-    G     │ Function     │ uint8   │ Part-of-speech / grammar
-    B     │ Extended     │ uint8   │ Context, tense, emotion
-```
+This engine does the opposite:
 
-R/G/B values are **not hardcoded** — the AI dynamically maps them through directional diffusion:
+- **Unlimited parameters** — each new clause is a new frame, frames stack without limit
+- **Unlimited context** — bounded only by disk
+- **Inspectable** — `A` channel is a heatmap you can open and eyeball
+- **Incremental** — new text = one delta or one new keyframe, never a full retrain
+- **Tiny** — one frame ≈ 320 KB, engine core is a few MB; runs on Termux / embedded
 
-```
-  R ← diagonal neighbors (↗↘↙↖)   α = 0.05   morpheme/semantic
-  G ← vertical neighbors  (↑↓)     β = 0.08   word substitution
-  B ← horizontal neighbors (←→)    γ = 0.03   clause ordering
-```
+The cost: pattern encoding is a bet that byte-level spatial statistics carry
+enough signal. The current benchmarks say "yes, enough to be useful as a
+retrieval + recall substrate," not "yes, it replaces an LLM."
 
-### 3. Matching Pipeline
+---
 
-Two-stage search: fast coarse filter, then precise scoring.
+## How it works
 
-```
-  Input clause
-       │
-       ▼
-  ┌─────────────────────┐
-  │  3-Layer Encoding    │
-  │  + RGB Directional   │
-  └──────────┬──────────┘
-             │
-       ┌─────▼──────┐       KF < 100: full overlap scan
-       │  Stage 1    │       KF ≥ 100: hash bucket → overlap
-       │  Coarse     │
-       │  (overlap)  │──── Top-K candidates (K=8)
-       └─────┬──────┘
-             │
-       ┌─────▼──────┐
-       │  Stage 2    │       RGB-weighted cosine similarity
-       │  Precise    │       + block skip optimization
-       │  (cosine)   │──── Best match + similarity %
-       └─────────────┘
-```
+### 1. Three-layer bitmap summation
 
-### 4. Keyframe / Delta Storage
+Every clause is encoded through three independent layers that are then summed into
+the `A` channel. The weights are picked so the overlap tiers become visibly separated.
 
-Like video codecs: I-frames (full snapshots) and P-frames (diffs only).
+| Layer | Target | Weight | What it captures |
+|---|---|---|---|
+| **Base** | every byte | **+1** | raw byte positions |
+| **Morpheme** | noun/verb/adj… byte ranges | **+3** | morpheme-level structure |
+| **Word** | space-split word bytes | **+5** | word-level emphasis |
+
+Overlap tiers in the combined `A`:
 
 ```
-  Frame 0: [I] "귀여운 고양이가 밥을 먹는다."   topic: animal_meal
-  Frame 1: [P] "귀여운 강아지가 물을 먹는다."   topic: animal_meal  (Δ16px from F0)
-  Frame 2: [I] "우리는 함께 오랜 세월을 살았다." topic: nostalgia
-  Frame 3: [I] "오늘 아침 하늘이 밝다."         topic: sky
-  ...
-  Frame N: ∞ (unlimited context via frame stacking)
-
-  ┌──────────────────────────────────────────┐
-  │  similarity ≥ 0.3 → store as delta (P)   │
-  │  similarity < 0.3 → new keyframe (I)     │
-  └──────────────────────────────────────────┘
+  base only               A = 1
+  base + morpheme         A = 4   (1 + 3)
+  base + word             A = 6   (1 + 5)
+  base + word + morpheme  A = 9   (1 + 3 + 5)  ← content morpheme inside a word
 ```
 
-### 5. Engine Optimizations
+Current numbers on `"귀여운 고양이가 밥을 먹는다."` (from `test_layers`):
 
 ```
-  Optimization          │ Result                  │ Speedup
- ────────────────────────┼─────────────────────────┼──────────
-  1D aligned memory      │ AVX2/SIMD ready         │  2-5×
-  Block skip (16×16)     │ 93% blocks skipped      │  2-4×
-                         │ 0.000% accuracy loss    │
-  Adaptive Top-K         │ hash buckets for KF≥100 │ 10-50×
-  Sparse delta           │ 16 entries = 96 bytes   │ memory
-  LRU cache (256 slots)  │ 90% hit rate            │  2-10×
- ────────────────────────┼─────────────────────────┼──────────
-  Combined               │ accuracy 100% preserved │ 20-100×
+  active  = 40 pixels
+  max A   = 9
+  total A = 297
+
+  base total   = 40
+  word total   = 185
+  morph total  = 72
+  sum check    = 40 + 185 + 72 = 297   ✓  (conservation holds)
 ```
 
-## Verified Results
+### 2. RGBA channels
+
+| Channel | Type | Role | How it's set |
+|---|---|---|---|
+| **A** | `uint16` | Brightness / importance | 3-layer sum |
+| **R** | `uint8`  | Semantic (content-word / meaning) | morpheme POS seed + **diagonal** diffusion |
+| **G** | `uint8`  | Functional (particle / ending / punct) | morpheme POS seed + **vertical** diffusion |
+| **B** | `uint8`  | Extended (context / order / emotion slot) | left at 0 by encoder; evolves via **horizontal** diffusion |
+
+R/G/B are **not fixed tables**. After encoding, `update_rgb_directional`
+propagates each channel along its own axis inside the clause's own grid
+(never across slots, never across clauses):
 
 ```
-  Test Suite: 34/34 PASS
-
-  Cosine (similar clauses):     78.5%  ✓
-  Cosine (different clauses):    0.0%  ✓
-  Block skip vs full cosine:   0.000% difference  ✓
-  Summation conservation:      151 = 40+74+37  ✓
-  Delta entries (similar):     16 px  ✓
-  LRU hit rate (4-slot sim):   90%  ✓
-
-  Similarity Matrix:
-  ┌──────┬───────┬───────┬───────┐
-  │      │  F0   │  F1   │  F2   │
-  ├──────┼───────┼───────┼───────┤
-  │  F0  │100.0% │  2.7% │  0.0% │
-  │  F1  │  2.7% │100.0% │  9.1% │
-  │  F2  │  0.0% │  9.1% │100.0% │
-  └──────┴───────┴───────┴───────┘
-
-  F0: "귀여운 고양이가 밥을 먹는다."
-  F1: "우리는 함께 오랜 세월을 살았다."
-  F2: "오늘 아침 하늘이 밝다."
+  R ← diagonal neighbors  (↗ ↘ ↙ ↖)    α = 0.05   morpheme / semantic
+  G ← vertical neighbors  (↑ ↓)        β = 0.08   word substitution
+  B ← horizontal neighbors (← →)       γ = 0.03   clause order / context
 ```
 
-## Morpheme Analyzer
+Implementation notes that matter:
 
-Dictionary-based longest-match tokenizer. No external libraries required.
+- **Read/write buffers are separated** (`oldR/newR`, `oldG/newG`, `oldB/newB`)
+  so the scan direction doesn't bias the update.
+- When the average neighbor delta rounds to zero but isn't actually zero, the
+  cell still moves by ±1. Small signals don't get silently killed.
+- `A` is *only* a mask here. The RGB update never edits `A`.
+- The encoder no longer stamps a per-clause B hash — the bitmap pattern
+  (X = byte value, Y = order, A = 3-layer sum) is already the fingerprint.
 
-```
-  Input                 Output
- ─────────────────────────────────────────────────────
-  "귀여운"          →  [adjective: 귀여운]
-  "고양이가"        →  [noun: 고양이] + [particle: 가]
-  "밥을"            →  [noun: 밥]    + [particle: 을]
-  "먹는다."         →  [verb: 먹]    + [ending: 는다] + [punct: .]
-```
+### 3. Keyframe / Delta storage
 
-```
-  Dictionary composition:
-  ├── Nouns       88  (animals, food, objects, nature, people, abstract)
-  ├── Verbs       39  (먹, 가, 오, 보, 하, 되, ...)
-  ├── Adjectives  20  (귀여운, 예쁜, 밝은, 아름다운, ...)
-  ├── Particles   26  (은/는/이/가/을/를/에서/으로, ...)
-  └── Endings     20  (는다/었다/았다/겠다, ...)
-```
-
-## Project Structure
+Video-codec style. `ai_store_auto` decides per clause:
 
 ```
-├── include/              # Header files
-│   ├── spatial_grid.h        # 256×256 grid, encoding/decoding
-│   ├── spatial_layers.h      # 3-layer summation engine
-│   ├── spatial_morpheme.h    # Korean morpheme analyzer
-│   ├── spatial_keyframe.h    # Keyframe / delta / frame
-│   ├── spatial_match.h       # Cosine similarity, matching
-│   └── spatial_context.h     # Context frames, LRU cache
-├── src/                  # Source files
-│   ├── spatial_grid.c
-│   ├── spatial_layers.c
-│   ├── spatial_morpheme.c
-│   ├── spatial_keyframe.c
-│   ├── spatial_match.c
-│   └── spatial_context.c
-├── dict/                 # Korean dictionaries
-│   ├── nouns.txt
-│   ├── verbs.txt
-│   ├── adjectives.txt
-│   ├── particles.txt
-│   └── endings.txt
-├── tests/                # 7 test suites, 34 tests
-│   ├── test_grid.c
-│   ├── test_layers.c
-│   ├── test_morpheme.c
-│   ├── test_match.c
-│   ├── test_keyframe.c
-│   ├── test_context.c
-│   └── test_integration.c
-├── data/                 # Sample data and download scripts
-├── tools/                # Utilities (GPU training, etc.)
-├── Makefile              # Build system
-├── SPEC.md               # Core specification v3.0
-└── SPEC-ENGINE.md        # Engine optimization spec
+  first clause                               → new keyframe (I-frame)
+  best cosine-A similarity ≥ 0.3 vs. any KF  → delta (P-frame) against that parent
+  best similarity < 0.3                      → new keyframe
 ```
 
-## Build & Test
+Delta records are **sparse** — only the cells that actually moved:
+
+```c
+typedef struct {
+    uint32_t index;   // y*256 + x
+    int16_t  diff_A;
+    int8_t   diff_R;
+    int8_t   diff_G;
+} DeltaEntry;         // 8 bytes
+```
+
+`apply_delta(base, entries, count, out)` reconstructs the target grid bit-for-bit.
+The `test_io` roundtrip test verifies that `|sim_before − sim_after| < 0.001`
+over 700 clauses across save → destroy → load.
+
+### 4. Matching cascade
+
+```
+  query clause
+      │
+      ▼
+  ┌─────────────────────────┐
+  │ encode (3 layers)        │
+  │ update_rgb_directional   │
+  └───────────┬─────────────┘
+              │
+        Step 1: A-only          overlap_score coarse  →  Top-K (K=8)
+              │                 cosine_a_only on Top-K
+              │                 if best ≥ 0.5  →  early return
+              ▼
+        Step 2: channel pair    CASCADE_QA   → rg_score
+              │                 CASCADE_GEN  → bg_score
+              │                 Top-K from all KFs
+              ▼
+        Step 3: cross re-rank   CASCADE_QA   → ba_score on Top-K
+              │                 CASCADE_GEN  → ra_score on Top-K
+              ▼
+        Step 4 (topk only):     "other" fallback if Step 1-3 all empty
+              │
+              ▼
+        best id + similarity
+```
+
+Three cascade modes expose this in `spatial_match.h`:
+
+- `CASCADE_SEARCH` — A-only top-K (pure retrieval)
+- `CASCADE_QA` — favors R×G overlap, re-ranks with B×A
+- `CASCADE_GENERATE` — favors B×G overlap, re-ranks with R×A
+
+### 5. Canvas Pool (subtitle routing)
+
+Above the per-clause grid there's a **2048×1024 Canvas** that tiles 32 × 256×256
+clause slots. A `SubtitleTrack` records `(DataType, canvas_id, slot_id)` for
+each stored clause so `pool_match` can jump straight to slots of the query's
+own type (prose / dialog / code / short), then cascade through the four
+channel-pair stages as above.
+
+This gives the "H.264 scene change" behavior:
+a canvas can be `KEYFRAME` or `DELTA-of-parent-canvas`, and save/load
+preserves parent_canvas_id + changed_ratio + classified flag.
+
+---
+
+## Current verified results
+
+Everything below is reproduced by `make test` on this branch
+(`claude/refactor-canvas-spatial-ai-FJt1Y`).
+
+### Test suite
+
+```
+  test_grid         6/6
+  test_morpheme     5/5
+  test_layers       3/3
+  test_match        5/5
+  test_keyframe     6/6
+  test_context      5/5
+  test_integration  4/4
+  test_io           7/7
+  test_cascade      6/6
+  test_canvas       6/6
+  test_adaptive     8/8
+  test_subtitle     8/8
+  ───────────────────────
+  total            69/69   ALL TESTS PASSED
+```
+
+### Brightness distribution
+
+```
+  "귀여운 고양이가 밥을 먹는다."    →  active 40, max A = 9, total 297
+  conservation:                     297 = 40 + 185 + 72    (base+word+morph)
+```
+
+### Matching integrity
+
+```
+  block-skip vs full cosine               0.000% difference
+  KF0↔KF1 cosine (similar clauses)       73.2%
+  KF0↔KF2 cosine (different clauses)      0.0%
+  self-query cosine                     100.0%
+```
+
+### Pipeline smoke test (`test_wiki data/sample_en.txt`, 50 clauses)
+
+```
+  clauses placed        50 / 50
+  canvases              2
+  self-query avg sim    100.0%
+  cascade step 1 hits   50
+  fallbacks             0
+  Recall@1 / @5 / @10   100% / 100% / 100%
+  next-clause top-1     22.0%     (beats best-of-5 random = 20%)
+  save size             20.9 MB   (.spai on disk)
+  load + append         OK        (4 canvases, 100 slots after append)
+```
+
+### Cascade / canvas
+
+```
+  cascade early-return on exact clause     ≥ CASCADE_STEP1_THRESHOLD (0.5)
+  ai_force_keyframe 1-1 mapping            kf_count == N, df_count == 0
+  pool_match jumps to same-type slots      step=1 on matching DataType
+  pool_match fallback to other types       step=4 when query type empty
+```
+
+---
+
+## Build & run
 
 ```bash
-# Build
+# Build everything
 make all
 
-# Run all tests
+# Full test suite (69 tests across 12 binaries)
 make test
 
 # Clean
 make clean
+
+# Wikipedia-style pipeline probe (uses data/sample_en.txt or data/sample_ko.txt)
+make wiki
+./build/test_wiki data/sample_en.txt
+./build/test_wiki data/sample_en.txt --save build/model.spai
+./build/test_wiki data/sample_en.txt --load build/model.spai
 ```
 
-**Requirements:** GCC (C11), Make, Linux/macOS/Windows (MinGW)
+**Requires:** GCC (C11), Make, POSIX (`posix_memalign`) or MinGW on Windows.
 
-## Recent Validation (2026-04-15)
-
-Re-validated on current `main`:
-
-- `bench_word_predict` (1000 clauses): Top-1 30.82%, Top-5 53.78%, Perplexity 98.52, PASS
-- `test_wiki` (200 clauses): Avg similarity 100.0%, Recall@1/5/10 = 78.5/89.0/96.0, PASS
-- `test_cascade`: 6/6 PASS (step routing and Top-K path)
-- quick generation diversity probe: 6 unique outputs out of 8 non-empty generations
-
-## Current 3-Layer Weights
-
-- Base: +1
-- Word: +5
-- Morpheme: +3
-
-Target overlap tiers in A-channel are 1/4/6/9.
-
-## Save/Load + Auto Save
-
-`bench_word_predict` supports:
-
-- `--save <path>`
-- `--load <path>`
-- `--load-only <path>`
-
-If `--save` is omitted and training runs, it auto-saves to:
-
-- `build/models/bench_word_predict_auto.spai`
-
-## Kaggle Free GPU Training (50,000 Clauses)
-
-Enable GPU in Kaggle notebook and run:
+### Benchmarks (optional)
 
 ```bash
-cd spatial_ai
-pip install -r requirements-gpu.txt
-python tools/kaggle_gpu_train.py \
-  --input data/sample_en.txt \
-  --max-clauses 50000 \
-  --checkpoint-every 5000
+make bench        # builds bench_stsb / bench_perplexity / bench_word_predict / bench_qa
+
+./build/bench_word_predict  data/sample_en.txt  1000
+./build/bench_qa            data/qa.tsv
+./build/bench_perplexity    data/sample_en.txt  500
+./build/bench_stsb          data/stsb.tsv
 ```
 
-Outputs:
+`bench_word_predict` also exposes `--save`, `--load`, `--load-only`.
+If `--save` is omitted, a run that actually trains auto-saves to
+`build/models/bench_word_predict_auto.spai`.
 
-- checkpoints: `build/gpu_models/gpu_checkpoint_*.pt`
-- final model: `build/gpu_models/gpu_model_final.pt`
+---
 
-Also see `make gpu_train_help`.
+## Save / Load
 
-## How Sorting and Training Proceed
-
-Sorting (retrieval):
-
-1. coarse filter by `overlap_score`
-2. Top-K partial sort (`topk_select`)
-3. rerank via RGB-weighted cosine
-4. optional hash-bucket path for larger pools
-
-Training:
-
-1. 3-layer encode (base/word/morpheme)
-2. morpheme POS-based R/G seed
-3. directional RGB diffusion (R diag, G vertical, B horizontal)
-4. accumulate to keyframe/delta or canvas pool
-5. save explicitly or via autosave at end of training
-
-## Key Properties
+Binary format `.spai` (`SPAI` magic, version 3):
 
 ```
-                  Traditional LLM           SPATIAL-PATTERN-AI
- ─────────────────────────────────────────────────────────────
-  Encoding       token → vector → matrix    byte → pixel → 256×256
-  Parameters     fixed-size matrix          unlimited frame stack
-  Context        bounded window (128K)      unlimited (disk-bound)
-  Interpretability opaque weights           visible heatmap
-  Learning       full retrain               incremental delta
-  Frame memory   —                          320 KB / frame
+  [Header 32B]   magic "SPAI" | version | kf_count | df_count | reserved[3]
+
+  [Records]*     tagged stream, KFs + deltas in insertion order
+    tag 0x01  Keyframe:  id + label[64] + text_byte_count + A + R + G + B
+    tag 0x02  Delta:     id + parent_id + label[64] + count + change_ratio + entries[]
+    tag 0x03  Weights:   global ChannelWeight (4× float)
+    tag 0x04  Canvas:    slot_count, canvas_type, frame_type, parent_canvas_id,
+                         changed_ratio, classified, SlotMeta[32], A + R + G + B
+    tag 0x05  Subtitle:  count + (type, topic_hash, canvas_id, slot_id, byte_length)[]
 ```
 
-## Unique Properties
+Public API (`include/spatial_io.h`):
 
-- **Interpretability**: Open the heatmap to visually confirm what the AI is remembering
-- **Unlimited Parameters**: No upper bound — parameters grow as frames accumulate
-- **Unlimited Context**: Scales as far as disk allows
-- **Incremental Learning**: New data adds only a delta or a new frame — no full retrain
-- **Rewind / Branching**: Traverse delta chains backwards to trace the learning history
-- **Lightweight**: 320 KB per frame; engine core is a few MB — runs on Termux and embedded systems
+```c
+SpaiStatus ai_save(const SpatialAI* ai, const char* path);
+SpatialAI* ai_load(const char* path, SpaiStatus* out_status);
+SpaiStatus ai_save_incremental(const SpatialAI* ai, const char* path);
+SpaiStatus ai_peek_header(const char* path,
+                          uint32_t* kf_count, uint32_t* df_count, uint32_t* version);
+```
+
+Guarantees validated by `test_io`:
+
+- **Roundtrip integrity**: 700 clauses → save → destroy → load → same query
+  cosine within `1e-3`.
+- **Incremental growth**: `ai_save_incremental` refuses to shrink
+  (returns `SPAI_ERR_STATE` if engine has fewer entries than disk) and
+  grows the file by the new records only.
+- **Forward compat**: unknown trailing tags are tolerated — older readers
+  stop cleanly instead of corrupting.
+- **Corrupt-file safety**: bad magic → `SPAI_ERR_MAGIC`,
+  bad version → `SPAI_ERR_VERSION`, truncated body → `SPAI_ERR_READ`.
+
+---
+
+## Project layout
+
+```
+├── include/                  # Public headers
+│   ├── spatial_grid.h        # 256×256 grid, 1D aligned channels
+│   ├── spatial_layers.h      # 3-layer summation (base / morpheme / word)
+│   ├── spatial_morpheme.h    # Korean morpheme analyzer (longest-match)
+│   ├── spatial_keyframe.h    # Keyframe / delta / SpatialAI engine
+│   ├── spatial_match.h       # Cosine, cascade modes, adaptive weights
+│   ├── spatial_context.h     # Context frames + LRU cache
+│   ├── spatial_canvas.h      # 2048×1024 canvas with 32 slots
+│   ├── spatial_subtitle.h    # SubtitleTrack + SpatialCanvasPool
+│   ├── spatial_generate.h    # Next-clause generation
+│   └── spatial_io.h          # .spai binary format (v3)
+├── src/                      # Implementations (one per header)
+├── dict/                     # Korean dictionaries (nouns/verbs/adj/particles/endings)
+├── tests/                    # 12 test binaries, 69 tests total
+├── data/                     # Sample corpora + download scripts
+├── tools/kaggle_gpu_train.py # Optional GPU training helper
+├── Makefile
+├── SPEC.md                   # Core spec (Page 1)
+├── SPEC-ENGINE.md            # Engine optimization spec (Page 2)
+└── README.md / README_KO.md
+```
+
+---
+
+## Engine optimizations
+
+All of these live in `src/spatial_match.c` + `src/spatial_keyframe.c` and are
+exercised by `test_match`, `test_integration`, `test_cascade`, `test_adaptive`.
+
+| Optimization | Where | Result |
+|---|---|---|
+| 1D aligned channels (32-byte) | `spatial_grid.c` | AVX2-ready, cache-line friendly |
+| Block skip (16×16 sums) | `compute_block_sums`, `cosine_block_skip` | 93% blocks skipped on clauses, **0.000%** accuracy loss |
+| Adaptive Top-K (hash buckets) | `bucket_index_*`, `grid_hash` | O(N) → O(N/B + K) for KF ≥ 100 |
+| Sparse delta | `compute_delta` / `DeltaEntry` | 16-entry delta = 128 B |
+| LRU frame cache | `spatial_context.c` | 90% hit on repeat access |
+| Adaptive channel weights | `ChannelWeight` + `weight_update` | winner-take-reward per store |
+| Directional RGB diffusion | `update_rgb_directional` | read/write split, min ±1 delta |
+
+Targets: 20–100× combined over a naïve per-cell cosine at 1000+ keyframes,
+with accuracy preserved.
+
+---
+
+## Morpheme analyzer
+
+Dictionary-based longest-match tokenizer. No external libs.
+
+```
+  Input              Output
+  ─────────────────────────────────────────────────
+  "귀여운"        → [adj: 귀여운]
+  "고양이가"      → [noun: 고양이] + [particle: 가]
+  "밥을"          → [noun: 밥] + [particle: 을]
+  "먹는다."       → [verb: 먹] + [ending: 는다] + [punct: .]
+```
+
+```
+  Dictionary
+  ├── Nouns       88   (animals, food, objects, nature, people, abstract)
+  ├── Verbs       39   (먹, 가, 오, 보, 하, 되, …)
+  ├── Adjectives  20   (귀여운, 예쁜, 밝은, 아름다운, …)
+  ├── Particles   26   (은/는/이/가/을/를/에서/으로, …)
+  └── Endings     20   (는다/었다/았다/겠다, …)
+```
+
+POS tags also seed the R / G channels before diffusion:
+
+```
+  POS_NOUN     R=40  G=30
+  POS_VERB     R=120 G=40
+  POS_ADJ      R=170 G=35
+  POS_PARTICLE R=8   G=85
+  POS_ENDING   R=12  G=95
+  POS_PUNCT    R=5   G=120
+  POS_UNKNOWN  R=210 G=20
+```
+
+---
+
+## vs. Traditional LLM
+
+```
+                      Traditional LLM            SPATIAL-PATTERN-AI
+  ───────────────────────────────────────────────────────────────────
+  Encoding            token → vector → matrix    byte → pixel → 256×256
+  Parameters          fixed-size matrix          unlimited frame stack
+  Context             bounded window (32K-1M)    unlimited (disk-bound)
+  Interpretability    opaque weights             visible heatmap
+  Learning            full retrain / SFT         incremental delta
+  Per-frame cost      —                          ~320 KB on disk
+  Retrieval           attention / embed search   overlap → cosine → cascade
+```
+
+Strengths: retrieval, incremental memory, rewindable learning, interpretability,
+embedded footprint.
+Trade-off: not a generative LLM replacement — it's a substrate for
+retrieval-heavy and memory-heavy tasks where pattern persistence matters.
+
+---
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE).
