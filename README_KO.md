@@ -110,4 +110,9 @@ MIT — [LICENSE](LICENSE) 참조.
 
 ## 문의
 
-협업, 라이선싱, 투자 문의는 이슈를 열거나 저장소 소유자 프로필을 통해 연락 바랍니다.
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **문의:** https://github.com/sjpupro-lab/CANVAS-Engine/issues
+
+협업, 라이선싱, 투자 문의는 위 채널을 통해 연락 바랍니다.

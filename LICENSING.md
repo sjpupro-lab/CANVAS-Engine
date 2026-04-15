@@ -168,3 +168,14 @@ The following items require review by qualified IP and commercial counsel in the
 - [INVESTORS.md](INVESTORS.md) — investor overview
 - [PITCH_DECK.md](PITCH_DECK.md) — slide deck
 - [LICENSING_KO.md](LICENSING_KO.md) — Korean version of this document
+
+---
+
+## Contact
+
+For commercial licensing (Tier 3), CLA intake, trademark requests, or any licensing-related inquiry:
+
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **Inquiries:** https://github.com/sjpupro-lab/CANVAS-Engine/issues

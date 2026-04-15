@@ -168,3 +168,14 @@ CANVAS는 **3단 오픈 코어(open-core) 구조**를 사용합니다.
 - [INVESTORS_KO.md](INVESTORS_KO.md) — 투자자 개요
 - [PITCH_DECK_KO.md](PITCH_DECK_KO.md) — 슬라이드 덱
 - [LICENSING.md](LICENSING.md) — 본 문서의 영문판
+
+---
+
+## 문의
+
+상업 라이선스(Tier 3), CLA 접수, 상표 요청 등 라이선스 관련 모든 문의:
+
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **문의:** https://github.com/sjpupro-lab/CANVAS-Engine/issues

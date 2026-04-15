@@ -208,4 +208,8 @@ Raising **[ round size / stage ]** to:
 **CANVAS** — A spatial pattern–based AI engine
 
 Collaboration · Licensing · Investment
-→ open an issue or reach out via the repository owner's profile
+
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **Inquiries:** https://github.com/sjpupro-lab/CANVAS-Engine/issues

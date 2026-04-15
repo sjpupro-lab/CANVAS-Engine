@@ -109,4 +109,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contact
 
-For collaboration, licensing, or investment inquiries, please open an issue or reach out via the repository owner's profile.
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **Inquiries:** https://github.com/sjpupro-lab/CANVAS-Engine/issues
+
+For collaboration, licensing, or investment inquiries, please reach out via the channels above.

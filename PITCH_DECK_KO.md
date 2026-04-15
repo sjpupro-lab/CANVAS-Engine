@@ -209,4 +209,8 @@ CANVAS는 이 세 가지를 처음부터 전제로 설계되었습니다.
 **CANVAS** — 공간 패턴 기반 AI 엔진
 
 협업 · 라이선싱 · 투자
-→ 이슈 혹은 저장소 소유자 프로필을 통해 연락 바랍니다
+
+- **GitHub:** https://github.com/sjpupro-lab/CANVAS-Engine
+- **Team:** SJPU TEAM
+- **Email:** sjpupro@gmail.com
+- **문의:** https://github.com/sjpupro-lab/CANVAS-Engine/issues
