@@ -71,6 +71,10 @@ static SpaiStatus write_keyframe_record(FILE* fp, const Keyframe* kf) {
     return SPAI_OK;
 }
 
+/* v4: delta entries are written field-by-field so struct padding and
+ * future field additions don't break the on-disk format. On-disk
+ * layout per entry: u32 index | i16 diff_A | i8 diff_R | i8 diff_G |
+ * i8 diff_B  →  9 bytes. */
 static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
     uint8_t tag = SPAI_TAG_DELTA;
     if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
@@ -81,9 +85,13 @@ static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
     if (fwrite(&df->count,     sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
     if (fwrite(&df->change_ratio, sizeof(float), 1, fp) != 1) return SPAI_ERR_WRITE;
 
-    if (df->count > 0) {
-        if (fwrite(df->entries, sizeof(DeltaEntry), df->count, fp) != df->count)
-            return SPAI_ERR_WRITE;
+    for (uint32_t i = 0; i < df->count; i++) {
+        const DeltaEntry* e = &df->entries[i];
+        if (fwrite(&e->index,  sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_A, sizeof(int16_t),  1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_R, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_G, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&e->diff_B, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
     }
     return SPAI_OK;
 }
@@ -116,7 +124,12 @@ static SpaiStatus read_keyframe_body(FILE* fp, Keyframe* kf) {
     return SPAI_OK;
 }
 
-static SpaiStatus read_delta_body(FILE* fp, DeltaFrame* df) {
+/* Read delta body, version-aware.
+ *   v <= 3: per-entry payload is { u32 index, i16 dA, i8 dR, i8 dG }
+ *           → 8 bytes, diff_B defaults to 0.
+ *   v >= 4: per-entry payload is { u32 index, i16 dA, i8 dR, i8 dG, i8 dB }
+ *           → 9 bytes. */
+static SpaiStatus read_delta_body(FILE* fp, uint32_t version, DeltaFrame* df) {
     memset(df, 0, sizeof(*df));
 
     if (fread(&df->id,        sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
@@ -129,8 +142,19 @@ static SpaiStatus read_delta_body(FILE* fp, DeltaFrame* df) {
     if (df->count > 0) {
         df->entries = (DeltaEntry*)malloc(df->count * sizeof(DeltaEntry));
         if (!df->entries) return SPAI_ERR_ALLOC;
-        if (fread(df->entries, sizeof(DeltaEntry), df->count, fp) != df->count)
-            return SPAI_ERR_READ;
+
+        for (uint32_t i = 0; i < df->count; i++) {
+            DeltaEntry* e = &df->entries[i];
+            if (fread(&e->index,  sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_A, sizeof(int16_t),  1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_R, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_READ;
+            if (fread(&e->diff_G, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_READ;
+            if (version >= 4) {
+                if (fread(&e->diff_B, sizeof(int8_t), 1, fp) != 1) return SPAI_ERR_READ;
+            } else {
+                e->diff_B = 0;
+            }
+        }
     }
     return SPAI_OK;
 }
@@ -396,7 +420,7 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 if (out_status) *out_status = SPAI_ERR_CORRUPT;
                 return NULL;
             }
-            s = read_delta_body(fp, &ai->deltas[dfs_read]);
+            s = read_delta_body(fp, h.version, &ai->deltas[dfs_read]);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;

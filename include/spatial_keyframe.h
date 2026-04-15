@@ -12,13 +12,17 @@ typedef struct {
     uint32_t    text_byte_count;
 } Keyframe;
 
-/* Delta entry: sparse format (SPEC-ENGINE Phase D) */
+/* Delta entry: sparse format (SPEC-ENGINE Phase D).
+ * Bumped to 9 logical bytes with diff_B. On-disk is written field-by-
+ * field so struct padding and cross-version size changes don't break
+ * compatibility — see write_delta_record / read_delta_body. */
 typedef struct {
     uint32_t index;     /* y * 256 + x */
     int16_t  diff_A;
     int8_t   diff_R;
     int8_t   diff_G;
-} DeltaEntry;  /* 8 bytes */
+    int8_t   diff_B;
+} DeltaEntry;
 
 /* RLE delta entry (for 4096 scale) */
 typedef struct {

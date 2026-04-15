@@ -140,12 +140,14 @@ uint32_t compute_delta(const SpatialGrid* base, const SpatialGrid* target,
         int16_t dA = (int16_t)target->A[i] - (int16_t)base->A[i];
         int8_t  dR = (int8_t)((int)target->R[i] - (int)base->R[i]);
         int8_t  dG = (int8_t)((int)target->G[i] - (int)base->G[i]);
+        int8_t  dB = (int8_t)((int)target->B[i] - (int)base->B[i]);
 
-        if (dA != 0 || dR != 0 || dG != 0) {
-            entries[count].index = i;
+        if (dA != 0 || dR != 0 || dG != 0 || dB != 0) {
+            entries[count].index  = i;
             entries[count].diff_A = dA;
             entries[count].diff_R = dR;
             entries[count].diff_G = dG;
+            entries[count].diff_B = dB;
             count++;
         }
     }
@@ -176,6 +178,11 @@ void apply_delta(const SpatialGrid* base, const DeltaEntry* entries,
         if (val_G < 0) val_G = 0;
         if (val_G > 255) val_G = 255;
         out->G[idx] = (uint8_t)val_G;
+
+        int val_B = (int)out->B[idx] + entries[i].diff_B;
+        if (val_B < 0) val_B = 0;
+        if (val_B > 255) val_B = 255;
+        out->B[idx] = (uint8_t)val_B;
     }
 }
 

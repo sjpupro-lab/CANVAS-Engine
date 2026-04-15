@@ -44,7 +44,7 @@
  */
 
 #define SPAI_MAGIC    "SPAI"
-#define SPAI_VERSION  3u       /* v3 adds canvas pool + subtitle track */
+#define SPAI_VERSION  4u       /* v4 adds DeltaEntry.diff_B (v3 kept readable) */
 
 #define SPAI_TAG_KEYFRAME  0x01
 #define SPAI_TAG_DELTA     0x02
