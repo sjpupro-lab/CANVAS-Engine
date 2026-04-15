@@ -228,9 +228,23 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(df->label, label, 63);
         df->label[63] = '\0';
         df->count = delta_count;
-        DeltaEntry* shrunk = (DeltaEntry*)realloc(entries, delta_count * sizeof(DeltaEntry));
-        df->entries = shrunk ? shrunk : entries;
-        df->change_ratio = (float)delta_count / (float)grid_active_count(input);
+        if (delta_count > 0) {
+            /* Shrink the scratch buffer to actual size. If realloc can't
+             * shrink in place and returns NULL, keep the original — which
+             * is still a valid free-able pointer. */
+            DeltaEntry* shrunk = (DeltaEntry*)realloc(entries,
+                                   delta_count * sizeof(DeltaEntry));
+            df->entries = shrunk ? shrunk : entries;
+        } else {
+            /* Identical clauses: delta has zero entries. realloc(ptr, 0)
+             * is implementation-defined (may free ptr and return NULL),
+             * so free explicitly and leave entries NULL. df->count == 0
+             * means readers/writers skip the array. */
+            free(entries);
+            df->entries = NULL;
+        }
+        uint32_t active = grid_active_count(input);
+        df->change_ratio = active ? (float)delta_count / (float)active : 0.0f;
 
         /* Adaptive feedback: good structural match → boost the channel
          * that most contributed. Compute per-channel similarities
