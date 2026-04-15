@@ -104,6 +104,13 @@ void apply_ema_to_grid(const SpatialAI* ai, SpatialGrid* grid);
  * ai_store_auto / ai_force_keyframe after the frame is committed. */
 void ema_update(SpatialAI* ai, const SpatialGrid* grid);
 
+/* Tune the similarity threshold ai_store_auto uses to decide
+ * delta vs new keyframe. Default 0.30 (engine-wide, process-local).
+ * Lower values (e.g. 0.15 for wiki abstracts) produce more deltas
+ * and a smaller model. Clamped to [0, 1]. */
+void  ai_set_store_threshold(float t);
+float ai_get_store_threshold(void);
+
 /* Forward declarations that avoid pulling spatial_subtitle.h into
  * every translation unit that needs SpatialAI. */
 struct SpatialCanvasPool_* ai_get_canvas_pool(SpatialAI* ai);  /* lazy create */

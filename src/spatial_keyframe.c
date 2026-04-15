@@ -9,23 +9,69 @@
 #define EMA_ALPHA            0.1f   /* new value weight per update */
 #define EMA_MIN_EVIDENCE     2.0f   /* skip cells with fewer observations */
 
+/* Runtime-overridable store threshold. Set by ai_set_store_threshold().
+ * On real wiki clauses the default 0.30 rarely triggers — see the
+ * practical test in tools/run_practical_test.sh — so callers (e.g.
+ * stream_train --threshold 0.15) can lower it for delta-heavy runs. */
+static float g_store_threshold = SIMILARITY_THRESHOLD;
+
+void ai_set_store_threshold(float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    g_store_threshold = t;
+}
+
+float ai_get_store_threshold(void) { return g_store_threshold; }
+
 /* ── Topic hashing ──
  *
- * Keyframes carry a topic_hash + seq_in_topic so ai_generate_next can
- * walk the same topic thread instead of always falling back to id+1.
- * topic_hash is derived from the `label` argument of the store call
- * (djb2 over the UTF-8 bytes). NULL / empty label yields 0 — callers
- * who don't tag their clauses get the legacy sequential behavior.
- * seq_in_topic is assigned as "one past the current max for this
- * topic" so insertion order within a topic is preserved without
- * needing a separate index structure. */
+ * Keyframes carry a topic_hash + seq_in_topic. The hash groups
+ * clauses that likely belong to the same document so ai_store_auto
+ * can skip the O(KF) flat scan and only compare the new clause
+ * against same-topic keyframes. When enough same-topic clauses
+ * cluster, deltas trigger instead of exploding the keyframe count.
+ *
+ * Derivation precedence:
+ *   1. non-empty label: djb2(label) — explicit document tag
+ *   2. else:            djb2(first space-delimited token of clause)
+ *   3. else:            0 (legacy sequential behavior)
+ *
+ * Using only the first token is intentional: wiki abstracts often
+ * lead every clause with the article subject ("Anarchism is ...",
+ * "Anarchism advocates ..."), so a 1-token fingerprint clusters
+ * them cheaply without the cost of a full doc classifier. */
+static uint32_t djb2_bytes(const unsigned char* p, size_t n) {
+    uint32_t h = 5381u;
+    for (size_t i = 0; i < n; i++) h = h * 33u + (uint32_t)p[i];
+    return h;
+}
+
+static uint32_t topic_hash_from_text(const char* text) {
+    if (!text) return 0;
+    const unsigned char* p = (const unsigned char*)text;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const unsigned char* start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+           *p != '.' && *p != ',' && *p != '!' && *p != '?') p++;
+    size_t n = (size_t)(p - start);
+    if (n == 0) return 0;
+    uint32_t h = djb2_bytes(start, n);
+    return h ? h : 1;
+}
+
 static uint32_t topic_hash_from_label(const char* label) {
     if (!label || !*label) return 0;
-    uint32_t h = 5381;
-    for (const unsigned char* p = (const unsigned char*)label; *p; p++) {
-        h = h * 33u + (uint32_t)*p;
-    }
-    return h ? h : 1; /* reserve 0 for "no topic" */
+    uint32_t h = djb2_bytes((const unsigned char*)label, strlen(label));
+    return h ? h : 1;
+}
+
+/* Resolve the topic for a store call: label wins if provided, else the
+ * clause's first token. Returns 0 only when neither yields any bytes,
+ * which we treat as "no topic" (legacy flat-scan fallback). */
+static uint32_t resolve_topic(const char* clause_text, const char* label) {
+    uint32_t h = topic_hash_from_label(label);
+    if (h == 0) h = topic_hash_from_text(clause_text);
+    return h;
 }
 
 static uint32_t next_seq_in_topic(const SpatialAI* ai, uint32_t topic) {
@@ -41,6 +87,26 @@ static uint32_t next_seq_in_topic(const SpatialAI* ai, uint32_t topic) {
         }
     }
     return seen ? max_seq + 1 : 1;
+}
+
+/* Scan only keyframes carrying `topic` and return the best
+ * cosine_a_only match. Returns UINT32_MAX (no candidates) when no
+ * keyframe shares this topic. */
+static uint32_t topic_bucket_best_match(const SpatialAI* ai,
+                                        const SpatialGrid* input,
+                                        uint32_t topic,
+                                        float* out_sim) {
+    float best = -1.0f;
+    uint32_t best_id = UINT32_MAX;
+    if (topic != 0) {
+        for (uint32_t i = 0; i < ai->kf_count; i++) {
+            if (ai->keyframes[i].topic_hash != topic) continue;
+            float sim = cosine_a_only(input, &ai->keyframes[i].grid);
+            if (sim > best) { best = sim; best_id = i; }
+        }
+    }
+    if (out_sim) *out_sim = (best < 0.0f) ? 0.0f : best;
+    return best_id;
 }
 
 /* ── RGB EMA ──
@@ -312,6 +378,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
     update_rgb_directional(input);
     apply_ema_to_grid(ai, input);
 
+    uint32_t topic = resolve_topic(clause_text, label);
+
     /* If no keyframes yet, store as first keyframe */
     if (ai->kf_count == 0) {
         if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
@@ -321,8 +389,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
-        kf->topic_hash      = topic_hash_from_label(label);
-        kf->seq_in_topic    = kf->topic_hash ? 1 : 0;
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = topic ? 1 : 0;
         keyframe_alloc_grid(kf, input);
 
         ai->kf_count = 1;
@@ -332,18 +400,34 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         return 0;
     }
 
-    /* Find best matching keyframe via unified 2-stage match.
-     * MATCH_SEARCH keeps the A-only cosine semantics of the original
-     * hand-rolled loop, but now benefits from the bucket index when
-     * the corpus grows past BUCKET_THRESHOLD. */
-    MatchContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.bucket_idx = &ai->bucket_idx;
-    MatchResult mr = spatial_match(ai, input, MATCH_SEARCH, &ctx);
-    float    best_sim = mr.best_score;
-    uint32_t best_id  = mr.best_id;
+    /* Matching strategy (spec v3 — topic-bucketed):
+     *   1. If the clause has a topic, first walk only same-topic
+     *      keyframes. Same-topic clauses typically share a lot of
+     *      byte-position overlap (wiki abstracts often lead with
+     *      the article subject) so this small linear scan finds
+     *      deltas the flat scan missed.
+     *   2. Fall back to the unified spatial_match(MATCH_SEARCH)
+     *      cascade if the topic bucket is empty OR the best
+     *      same-topic sim failed to clear the threshold. The
+     *      cascade respects the bucket index when kf_count is
+     *      large. */
+    float    best_sim = 0.0f;
+    uint32_t best_id  = UINT32_MAX;
+    uint32_t bucket_best = topic_bucket_best_match(ai, input, topic, &best_sim);
+    if (bucket_best != UINT32_MAX) best_id = bucket_best;
 
-    if (best_sim >= SIMILARITY_THRESHOLD) {
+    if (best_sim < g_store_threshold) {
+        MatchContext ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.bucket_idx = &ai->bucket_idx;
+        MatchResult mr = spatial_match(ai, input, MATCH_SEARCH, &ctx);
+        if (mr.best_score > best_sim) {
+            best_sim = mr.best_score;
+            best_id  = mr.best_id;
+        }
+    }
+
+    if (best_sim >= g_store_threshold && best_id < ai->kf_count) {
         /* Store as delta frame */
         if (!ensure_df_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
 
@@ -403,8 +487,8 @@ uint32_t ai_store_auto(SpatialAI* ai, const char* clause_text, const char* label
         if (label) strncpy(kf->label, label, 63);
         kf->label[63] = '\0';
         kf->text_byte_count = (uint32_t)strlen(clause_text);
-        kf->topic_hash      = topic_hash_from_label(label);
-        kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = next_seq_in_topic(ai, topic);
         keyframe_alloc_grid(kf, input);
 
         /* Adaptive feedback for "novel" input: compare against the
@@ -447,7 +531,7 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     if (label) strncpy(kf->label, label, 63);
     kf->label[63] = '\0';
     kf->text_byte_count = (uint32_t)strlen(clause_text);
-    kf->topic_hash      = topic_hash_from_label(label);
+    kf->topic_hash      = resolve_topic(clause_text, label);
     kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
     keyframe_alloc_grid(kf, input);
 

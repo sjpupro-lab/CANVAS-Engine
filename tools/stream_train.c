@@ -52,17 +52,20 @@ typedef struct {
     uint32_t    checkpoint;
     int         verbose;
     int         verify;
+    float       threshold;    /* <0 means "leave engine default" */
 } StreamArgs;
 
 static void usage(const char* prog) {
     fprintf(stderr,
         "usage: %s --input <path> [--max N] [--save path] [--checkpoint N]\n"
-        "       [--verbose] [--verify]\n"
+        "       [--threshold F] [--verbose] [--verify]\n"
         "\n"
         "  --input <path>      input text file, one clause per line (required)\n"
         "  --max <N>           max clauses to ingest (default %d)\n"
         "  --save <path>       final model path (default build/models/stream_auto.spai)\n"
         "  --checkpoint <N>    save every N clauses (default %d, 0 disables)\n"
+        "  --threshold <F>     delta decision threshold in [0, 1]\n"
+        "                      (default 0.30; try 0.15 on wiki-style corpora)\n"
         "  --verbose           per-clause progress line\n"
         "  --verify            after training, run an unseen-query sanity pass\n",
         prog, DEFAULT_MAX, DEFAULT_CKPT);
@@ -75,6 +78,7 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
     a->checkpoint  = DEFAULT_CKPT;
     a->verbose     = 0;
     a->verify      = 0;
+    a->threshold   = -1.0f;
 
     for (int i = 1; i < argc; i++) {
         const char* k = argv[i];
@@ -90,6 +94,8 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
             long v = strtol(argv[++i], NULL, 10);
             if (v < 0) v = 0;
             a->checkpoint = (uint32_t)v;
+        } else if (strcmp(k, "--threshold") == 0 && i + 1 < argc) {
+            a->threshold = strtof(argv[++i], NULL);
         } else if (strcmp(k, "--verbose") == 0) {
             a->verbose = 1;
         } else if (strcmp(k, "--verify") == 0) {
@@ -275,9 +281,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (args.threshold >= 0.0f) {
+        ai_set_store_threshold(args.threshold);
+    }
+
     printf("[stream] reading: %s\n", args.input);
-    printf("[stream] max=%u  checkpoint=%u  save=%s\n",
-           args.max_clauses, args.checkpoint, args.save);
+    printf("[stream] max=%u  checkpoint=%u  threshold=%.2f  save=%s\n",
+           args.max_clauses, args.checkpoint,
+           ai_get_store_threshold(), args.save);
 
     FILE* fp = fopen(args.input, "r");
     if (!fp) {
